@@ -1,0 +1,51 @@
+# Environment variables
+.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Backend local runtime storage & databases
+backend/data/
+!backend/data/.gitkeep
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
+backend/data/chroma/*
+!backend/data/chroma/.gitkeep
+backend/data/bm25/*
+!backend/data/bm25/.gitkeep
+*.db
+*.sqlite3
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local agent files and temporary work
+brain/
+scratch/
+reference_legacy/
+
+# Secrets and local environment files
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
