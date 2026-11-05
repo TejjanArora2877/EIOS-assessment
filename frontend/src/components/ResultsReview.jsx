@@ -102,9 +102,15 @@ export default function ResultsReview({ result, onNewEvaluation }) {
           <strong style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem', color: 'var(--text-primary)' }}>
             Overall Assessment Summary:
           </strong>
-          <p className="results-text-full" style={{ fontSize: '0.9rem', color: 'var(--text-primary)', margin: 0 }}>
-            {overall_feedback}
-          </p>
+          {overall_feedback ? (
+            <p className="results-text-full" style={{ fontSize: '0.9rem', color: 'var(--text-primary)', margin: 0 }}>
+              {overall_feedback}
+            </p>
+          ) : (
+            <p className="results-text-full" style={{ fontSize: '0.85rem', fontStyle: 'italic', color: 'var(--text-muted)', margin: 0 }}>
+              Feedback skipped (score-only mode).
+            </p>
+          )}
         </div>
       </div>
 
@@ -205,9 +211,15 @@ export default function ResultsReview({ result, onNewEvaluation }) {
                   <strong style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.825rem', color: 'var(--primary)' }}>
                     Constructive Feedback:
                   </strong>
-                  <p className="results-text-full" style={{ margin: 0, fontSize: '0.9rem', color: 'var(--text-primary)' }}>
-                    {crit.feedback}
-                  </p>
+                  {crit.feedback ? (
+                    <p className="results-text-full" style={{ margin: 0, fontSize: '0.9rem', color: 'var(--text-primary)' }}>
+                      {crit.feedback}
+                    </p>
+                  ) : (
+                    <p className="results-text-full" style={{ margin: 0, fontSize: '0.85rem', fontStyle: 'italic', color: 'var(--text-muted)' }}>
+                      Feedback skipped (score-only mode).
+                    </p>
+                  )}
                 </div>
               </div>
             );
@@ -306,9 +318,16 @@ export default function ResultsReview({ result, onNewEvaluation }) {
         </summary>
         <div style={{ marginTop: '0.75rem', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
           <div><strong>SHA256 Hash:</strong> {provenance?.text_sha256 ? `${provenance.text_sha256.substring(0, 16)}...` : 'N/A'}</div>
+          <div><strong>Feedback Mode:</strong> {provenance?.feedback_mode || 'N/A'}</div>
+          <div><strong>Ollama Calls:</strong> {provenance?.ollama_calls ?? 0}</div>
           <div><strong>Embedding Model:</strong> {provenance?.embedding_model || 'N/A'}</div>
           <div><strong>Reranker:</strong> {provenance?.reranker_model || 'N/A'}</div>
           <div><strong>NLI Classifier:</strong> {provenance?.nli_model || 'N/A'}</div>
+          {provenance?.stage_durations && (
+            <div style={{ gridColumn: '1 / -1', marginTop: '0.4rem', borderTop: '1px solid var(--border)', paddingTop: '0.4rem' }}>
+              <strong>Stage Durations:</strong> Scoring: {provenance.stage_durations.numerical_scoring_ms}ms | Feedback: {provenance.stage_durations.feedback_generation_ms}ms | Total: {provenance.stage_durations.total_grading_ms}ms
+            </div>
+          )}
         </div>
       </details>
     </div>

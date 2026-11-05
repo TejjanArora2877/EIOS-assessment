@@ -313,3 +313,73 @@ def test_feedback_mode_llm_selectable(sample_assessment):
         assert response.total_score == 10.0
         assert response.provenance.get("ollama_calls") == 4
         assert mock_client.post.call_count == 4
+
+def test_feedback_mode_none_score_only(sample_assessment):
+    """
+    Confirms feedback_mode='none' (Score-Only Benchmarking):
+    - Skips all LLM and deterministic feedback generation.
+    - Yields empty strings for criterion feedback and overall feedback.
+    - Sets ollama_calls=0 and feedback_generation_ms=0.0.
+    - Preserves 100% numerical marks, concepts, contradictions, and review flag parity.
+    """
+    perfect_text = (
+        "Memory-Based Learning is a machine-learning classification approach used in Natural Language Processing that uses stored training examples to help classify new instances. "
+        "It stores training examples as feature vectors and compares them with new instances using a similarity or distance measure. "
+        "MBL is a versatile and efficient learning framework. "
+        "Its uses in NLP include part-of-speech tagging, shallow parsing, morphological analysis, named entity recognition, and machine translation."
+    )
+
+    # 1. Baseline hybrid evaluation
+    res_hybrid = GradingEngine.grade_submission(
+        assessment=sample_assessment,
+        student_text=perfect_text,
+        feedback_mode="hybrid"
+    )
+
+    # 2. Score-only evaluation (guaranteeing Ollama is never touched)
+    with patch("backend.app.services.llm_feedback.LLMFeedbackService.get_client", side_effect=RuntimeError("Ollama must not be called")):
+        res_none = GradingEngine.grade_submission(
+            assessment=sample_assessment,
+            student_text=perfect_text,
+            feedback_mode="none"
+        )
+
+    # Parity assertions
+    assert res_none.total_score == res_hybrid.total_score
+    assert res_none.percentage == res_hybrid.percentage
+    assert res_none.requires_teacher_review == res_hybrid.requires_teacher_review
+    assert res_none.review_reasons == res_hybrid.review_reasons
+    assert len(res_none.criterion_breakdown) == len(res_hybrid.criterion_breakdown)
+
+    for c_none, c_hyb in zip(res_none.criterion_breakdown, res_hybrid.criterion_breakdown):
+        assert c_none.criterion_name == c_hyb.criterion_name
+        assert c_none.awarded_marks == c_hyb.awarded_marks
+        assert c_none.awarded_percentage == c_hyb.awarded_percentage
+        assert c_none.contradictions_detected == c_hyb.contradictions_detected
+        assert c_none.missing_concepts == c_hyb.missing_concepts
+        assert c_none.present_concepts == c_hyb.present_concepts
+        assert c_none.feedback == "", f"Expected empty feedback in score-only mode, got: {c_none.feedback}"
+
+    assert res_none.overall_feedback == ""
+    assert res_none.provenance["feedback_mode"] == "none"
+    assert res_none.provenance["ollama_calls"] == 0
+    assert res_none.provenance["stage_durations"]["feedback_generation_ms"] == 0.0
+
+    # 3. Test through HTTP API endpoint
+    with patch("backend.app.services.llm_feedback.LLMFeedbackService.get_client", side_effect=RuntimeError("Ollama must not be called")):
+        api_res = client.post(
+            "/grading/grade-text",
+            json={
+                "assessment_id": sample_assessment.id,
+                "student_text": perfect_text,
+                "feedback_mode": "none"
+            }
+        )
+    assert api_res.status_code == 200
+    api_data = api_res.json()
+    assert api_data["total_score"] == res_hybrid.total_score
+    assert api_data["overall_feedback"] == ""
+    assert all(c["feedback"] == "" for c in api_data["criterion_breakdown"])
+    assert api_data["provenance"]["feedback_mode"] == "none"
+    assert api_data["provenance"]["ollama_calls"] == 0
+    assert api_data["provenance"]["stage_durations"]["feedback_generation_ms"] == 0.0

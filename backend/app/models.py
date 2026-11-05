@@ -73,7 +73,7 @@ class AssessmentListResponse(BaseModel):
 class GradeTextRequest(BaseModel):
     assessment_id: str
     student_text: str = Field(..., description="Student's answer text")
-    feedback_mode: Optional[str] = Field(None, description="'hybrid' or 'llm'. If omitted, uses server setting.")
+    feedback_mode: Optional[str] = Field(None, description="'hybrid', 'llm', or 'none'. If omitted, uses server setting.")
 
 class EvidenceCitation(BaseModel):
     document_id: str
@@ -139,6 +139,9 @@ class BatchItemResult(BaseModel):
     student_text_preview: Optional[str] = None
     duration_s: Optional[float] = None
     ollama_calls: Optional[int] = None
+    stage_durations: Optional[Dict[str, float]] = None
+    extraction_ms: Optional[float] = None
+    persistence_ms: Optional[float] = None
 
 class BatchJobResponse(BaseModel):
     batch_id: str

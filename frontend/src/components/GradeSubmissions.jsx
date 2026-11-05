@@ -24,6 +24,7 @@ export default function GradeSubmissions({
   const pollTimerRef = useRef(null);
 
   // Common submission state
+  const [generateFeedback, setGenerateFeedback] = useState(true);
   const [grading, setGrading] = useState(false);
   const [gradingStage, setGradingStage] = useState('');
   const [error, setError] = useState(null);
@@ -109,15 +110,18 @@ export default function GradeSubmissions({
       setGrading(true);
       setGradingStage('Analyzing semantics, checking contradictions, and retrieving institutional evidence...');
 
+      const feedbackMode = generateFeedback ? 'hybrid' : 'none';
       let result;
       if (inputMode === 'text') {
-        result = await api.gradePastedText(selectedAssessmentId, studentText.trim());
+        result = await api.gradePastedText(selectedAssessmentId, studentText.trim(), feedbackMode);
       } else {
         setGradingStage('Extracting document text and routing to grading engine...');
-        result = await api.gradeUploadedFile(selectedAssessmentId, studentFile);
+        result = await api.gradeUploadedFile(selectedAssessmentId, studentFile, feedbackMode);
       }
 
-      setGradingStage('Generating constructive feedback from local LLM...');
+      if (generateFeedback) {
+        setGradingStage('Generating constructive feedback from local LLM...');
+      }
       onGradingSuccess(result);
     } catch (err) {
       setError(err.message || 'Evaluation failed.');
@@ -149,7 +153,8 @@ export default function GradeSubmissions({
     try {
       setGrading(true);
       setGradingStage('Uploading archive and validating documents...');
-      const initialJob = await api.gradeBatchZip(selectedAssessmentId, batchZipFile);
+      const feedbackMode = generateFeedback ? 'hybrid' : 'none';
+      const initialJob = await api.gradeBatchZip(selectedAssessmentId, batchZipFile, feedbackMode);
       setBatchJob(initialJob);
       setBatchPolling(true);
     } catch (err) {
@@ -230,7 +235,7 @@ export default function GradeSubmissions({
         )}
 
         {/* Input Mode Selector Tabs */}
-        <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
           <button
             type="button"
             className={`btn ${inputMode === 'text' ? 'btn-primary' : 'btn-secondary'}`}
@@ -255,6 +260,33 @@ export default function GradeSubmissions({
           >
             📦 Batch: Upload ZIP Archive
           </button>
+        </div>
+
+        {/* Feedback Mode Toggle */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.65rem',
+          padding: '0.6rem 0.85rem',
+          backgroundColor: 'var(--bg-secondary)',
+          borderRadius: 'var(--radius)',
+          border: '1px solid var(--border)',
+          marginBottom: '1.5rem'
+        }}>
+          <input
+            id="feedback-mode-toggle"
+            type="checkbox"
+            checked={generateFeedback}
+            onChange={(e) => setGenerateFeedback(e.target.checked)}
+            disabled={grading || batchPolling}
+            style={{ width: '1.1rem', height: '1.1rem', cursor: 'pointer' }}
+          />
+          <label htmlFor="feedback-mode-toggle" style={{ cursor: 'pointer', margin: 0, fontSize: '0.85rem' }}>
+            <span style={{ fontWeight: 600 }}>Generate Feedback</span>{' '}
+            <span style={{ color: 'var(--text-secondary)' }}>
+              ({generateFeedback ? 'Active: LLM / hybrid feedback enabled' : 'Off: Score-only benchmarking mode; skips Ollama/feedback calls'})
+            </span>
+          </label>
         </div>
 
         {/* Single Submission Form */}
@@ -453,6 +485,12 @@ export default function GradeSubmissions({
                       <div style={{ fontSize: '0.75rem', color: 'var(--danger)', textTransform: 'uppercase' }}>Failed</div>
                       <div style={{ fontSize: '1.3rem', fontWeight: 700, color: 'var(--danger)' }}>{batchJob.failed}</div>
                     </div>
+                    <div style={{ padding: '0.75rem', backgroundColor: '#fff', border: '1px solid var(--border)', borderRadius: '6px', textAlign: 'center' }}>
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', textTransform: 'uppercase' }}>Elapsed Time</div>
+                      <div style={{ fontSize: '1.3rem', fontWeight: 700, color: 'var(--primary)' }}>
+                        {batchJob.total_duration_s != null ? `${batchJob.total_duration_s.toFixed(2)}s` : '-'}
+                      </div>
+                    </div>
                   </div>
 
                   {/* Action buttons */}
@@ -498,6 +536,7 @@ export default function GradeSubmissions({
                           <th style={{ padding: '0.75rem' }}>Status</th>
                           <th style={{ padding: '0.75rem' }}>Score</th>
                           <th style={{ padding: '0.75rem' }}>Percentage</th>
+                          <th style={{ padding: '0.75rem' }}>Duration</th>
                           <th style={{ padding: '0.75rem' }}>Flags</th>
                           <th style={{ padding: '0.75rem', textAlign: 'right' }}>Details</th>
                         </tr>
@@ -536,6 +575,9 @@ export default function GradeSubmissions({
                             <td style={{ padding: '0.75rem' }}>
                               {item.percentage != null ? `${item.percentage.toFixed(1)}%` : '-'}
                             </td>
+                            <td style={{ padding: '0.75rem', color: 'var(--text-secondary)' }}>
+                              {item.duration_s != null ? `${item.duration_s.toFixed(2)}s` : '-'}
+                            </td>
                             <td style={{ padding: '0.75rem' }}>
                               {item.requires_teacher_review && (
                                 <span className="badge badge-warning" style={{ backgroundColor: 'var(--warning-bg)', color: 'var(--warning)' }}>
@@ -573,29 +615,14 @@ export default function GradeSubmissions({
 
       {/* Modal Dialog for Viewing Batch Item Breakdown */}
       {selectedBatchItem && (
-        <div style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          backgroundColor: 'rgba(0, 0, 0, 0.5)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 100,
-          padding: '1.5rem'
-        }}>
-          <div style={{
-            backgroundColor: '#fff',
-            borderRadius: '8px',
-            maxWidth: '800px',
-            width: '100%',
-            maxHeight: '90vh',
-            overflowY: 'auto',
-            padding: '1.5rem',
-            boxShadow: 'var(--shadow-md)'
-          }}>
+        <div
+          className="batch-breakdown-modal-backdrop"
+          onClick={() => setSelectedBatchItem(null)}
+        >
+          <div
+            className="batch-breakdown-modal-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex-between" style={{ marginBottom: '1rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.75rem' }}>
               <div>
                 <h3 style={{ fontSize: '1.2rem', fontWeight: 600 }}>
@@ -639,7 +666,7 @@ export default function GradeSubmissions({
                     </span>
                   </div>
                   <div style={{ fontSize: '0.85rem', color: 'var(--text-primary)', marginTop: '0.35rem' }}>
-                    <strong>Feedback:</strong> {crit.feedback}
+                    <strong>Feedback:</strong> {crit.feedback ? crit.feedback : <em style={{ color: 'var(--text-muted)' }}>Feedback skipped (score-only mode).</em>}
                   </div>
                   {crit.contradictions_detected && crit.contradictions_detected.length > 0 && (
                     <div style={{ fontSize: '0.8rem', color: 'var(--danger)', marginTop: '0.25rem' }}>

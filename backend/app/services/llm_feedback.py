@@ -385,8 +385,15 @@ class LLMFeedbackService:
         is_zero = awarded_marks == 0.0
 
         effective_mode = (feedback_mode or settings.FEEDBACK_MODE).lower()
-        if effective_mode not in ("hybrid", "llm"):
+        if effective_mode not in ("hybrid", "llm", "none"):
             effective_mode = "hybrid"
+
+        if effective_mode == "none":
+            if feedback_stats is not None:
+                feedback_stats["ollama_called"] = False
+                feedback_stats["duration_ms"] = 0.0
+                feedback_stats["deterministic_reason"] = "feedback_mode_none"
+            return ""
 
         # Context stopwords from the assessment question to prevent domain-level drift false positives
         q_tokens = cls._get_criterion_tokens(question) if question else set()
@@ -714,9 +721,12 @@ Provide 1-2 concise, constructive feedback sentences for the student adhering to
         question: str,
         total_score: float,
         max_score: float,
-        review_reasons: List[str]
+        review_reasons: List[str],
+        feedback_mode: Optional[str] = None
     ) -> str:
         """Generates a concise overall summary of student performance."""
+        if feedback_mode and feedback_mode.lower() == "none":
+            return ""
         percentage = (total_score / max_score * 100) if max_score > 0 else 0
         if total_score == 0.0 or percentage == 0.0:
             summary = "The submission does not address the assessed topic or meet any rubric criteria."

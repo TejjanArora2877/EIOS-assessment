@@ -202,6 +202,18 @@ def test_batch_zip_execution_and_isolation(sample_assessment, monkeypatch):
     assert r3["status"] == "skipped"
     assert "empty or contains no readable text" in r3["error_message"].lower()
 
+    # Verify timing metrics
+    assert final_job["total_duration_s"] is not None and final_job["total_duration_s"] > 0
+    assert r1["duration_s"] is not None and r1["duration_s"] > 0
+    assert r1["extraction_ms"] is not None and r1["extraction_ms"] >= 0
+    assert r1["persistence_ms"] is not None and r1["persistence_ms"] >= 0
+    assert r1["stage_durations"] is not None
+    assert "retrieval_ms" in r1["stage_durations"]
+    assert "numerical_scoring_ms" in r1["stage_durations"]
+    assert "feedback_generation_ms" in r1["stage_durations"]
+    assert final_job["total_duration_s"] >= r1["duration_s"]
+    assert r3["duration_s"] is not None and r3["duration_s"] >= 0
+
     # Check CSV export
     csv_res = client.get(f"/grading/batch/{batch_id}/csv")
     assert csv_res.status_code == 200
@@ -212,6 +224,7 @@ def test_batch_zip_execution_and_isolation(sample_assessment, monkeypatch):
     assert "Filename" in header
     assert "Algorithm Mechanism (Awarded)" in header
     assert "Time Quantum (Awarded)" in header
+    assert "Duration (s)" in header
     assert "student_1.txt" in csv_res.text
     assert "student_2.txt" in csv_res.text
     assert "student_empty.txt" in csv_res.text

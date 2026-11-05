@@ -73,6 +73,7 @@ class BatchManager:
     """
     _lock = threading.Lock()
     _batches: Dict[str, BatchJobResponse] = {}
+    _batch_start_times: Dict[str, float] = {}
 
     @classmethod
     def validate_and_extract_zip(cls, zip_path: str, extract_dir: str) -> List[Tuple[str, str]]:
@@ -168,13 +169,17 @@ class BatchManager:
         )
         with cls._lock:
             cls._batches[batch_id] = job
+            cls._batch_start_times[batch_id] = time.perf_counter()
         return job
 
     @classmethod
     def get_batch(cls, batch_id: str) -> Optional[BatchJobResponse]:
         """Retrieves current batch status."""
         with cls._lock:
-            return cls._batches.get(batch_id)
+            job = cls._batches.get(batch_id)
+            if job and job.status == "processing" and batch_id in cls._batch_start_times:
+                job.total_duration_s = round(time.perf_counter() - cls._batch_start_times[batch_id], 3)
+            return job
 
     @classmethod
     def process_batch_worker(
@@ -190,11 +195,12 @@ class BatchManager:
         Ensures complete submission isolation, robust error recovery, and proper cleanup.
         """
         logger.info(f"Starting batch {batch_id} processing with {len(extracted_files)} files.")
-        t_batch_start = time.perf_counter()
+        t_batch_start = cls._batch_start_times.get(batch_id, time.perf_counter())
         try:
             for filename, file_path in extracted_files:
                 t_file_start = time.perf_counter()
                 student_text = ""
+                ext_ms = 0.0
                 try:
                     t_ext0 = time.perf_counter()
                     extracted = TextExtractor.extract_from_file(file_path)
@@ -208,7 +214,8 @@ class BatchManager:
                         filename=filename,
                         status="failed",
                         error_message=f"Text extraction failed: {str(extract_err)}",
-                        duration_s=file_dur
+                        duration_s=file_dur,
+                        extraction_ms=round(ext_ms, 2)
                     )
                     with cls._lock:
                         if batch_id in cls._batches:
@@ -225,7 +232,8 @@ class BatchManager:
                         status="skipped",
                         error_message="Uploaded file is empty or contains no readable text.",
                         duration_s=file_dur,
-                        ollama_calls=0
+                        ollama_calls=0,
+                        extraction_ms=round(ext_ms, 2)
                     )
                     with cls._lock:
                         if batch_id in cls._batches:
@@ -244,10 +252,19 @@ class BatchManager:
                     )
 
                     # Persist record for auditability
+                    t_persist0 = time.perf_counter()
                     _save_grading_record(grading_response, student_text, sub_type="file", sub_filename=filename)
+                    persist_ms = (time.perf_counter() - t_persist0) * 1000
 
                     file_dur = round(time.perf_counter() - t_file_start, 3)
                     calls_count = grading_response.provenance.get("ollama_calls", 0) if isinstance(grading_response.provenance, dict) else 0
+
+                    stage_durations = {}
+                    if isinstance(grading_response.provenance, dict) and "stage_durations" in grading_response.provenance:
+                        stage_durations = dict(grading_response.provenance["stage_durations"])
+                    stage_durations["extraction_ms"] = round(ext_ms, 2)
+                    stage_durations["persistence_ms"] = round(persist_ms, 2)
+
                     item_res = BatchItemResult(
                         filename=filename,
                         status="completed",
@@ -258,7 +275,10 @@ class BatchManager:
                         criterion_breakdown=grading_response.criterion_breakdown,
                         student_text_preview=student_text[:120].strip(),
                         duration_s=file_dur,
-                        ollama_calls=calls_count
+                        ollama_calls=calls_count,
+                        stage_durations=stage_durations,
+                        extraction_ms=round(ext_ms, 2),
+                        persistence_ms=round(persist_ms, 2)
                     )
                     with cls._lock:
                         if batch_id in cls._batches:
@@ -272,7 +292,8 @@ class BatchManager:
                         status="failed",
                         error_message=f"Grading failed: {str(grade_err)}",
                         duration_s=file_dur,
-                        ollama_calls=0
+                        ollama_calls=0,
+                        extraction_ms=round(ext_ms, 2)
                     )
                     with cls._lock:
                         if batch_id in cls._batches:
@@ -344,6 +365,7 @@ class BatchManager:
         for name in criteria_names:
             headers.append(f"{name} (Awarded)")
             headers.append(f"{name} (Max)")
+        headers.append("Duration (s)")
         headers.append("Error Details")
 
         writer.writerow(headers)
@@ -373,6 +395,7 @@ class BatchManager:
                     row.append("")
                     row.append("")
 
+            row.append(f"{item.duration_s:.2f}" if item.duration_s is not None else "")
             row.append(item.error_message or "")
             writer.writerow(row)
 

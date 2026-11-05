@@ -93,22 +93,29 @@ export const api = {
   },
 
   // Section 3: Grade Student Answers
-  async gradePastedText(assessmentId, studentText) {
+  async gradePastedText(assessmentId, studentText, feedbackMode = 'hybrid') {
+    const payload = {
+      assessment_id: assessmentId,
+      student_text: studentText,
+    };
+    if (feedbackMode) {
+      payload.feedback_mode = feedbackMode;
+    }
     const res = await fetch(`${API_BASE}/grading/grade-text`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        assessment_id: assessmentId,
-        student_text: studentText,
-      }),
+      body: JSON.stringify(payload),
     });
     return handleResponse(res);
   },
 
-  async gradeUploadedFile(assessmentId, file) {
+  async gradeUploadedFile(assessmentId, file, feedbackMode = 'hybrid') {
     const formData = new FormData();
     formData.append('assessment_id', assessmentId);
     formData.append('file', file);
+    if (feedbackMode) {
+      formData.append('feedback_mode', feedbackMode);
+    }
 
     const res = await fetch(`${API_BASE}/grading/grade-file`, {
       method: 'POST',
@@ -117,10 +124,13 @@ export const api = {
     return handleResponse(res);
   },
 
-  async gradeBatchZip(assessmentId, zipFile) {
+  async gradeBatchZip(assessmentId, zipFile, feedbackMode = 'hybrid') {
     const formData = new FormData();
     formData.append('assessment_id', assessmentId);
     formData.append('file', zipFile);
+    if (feedbackMode) {
+      formData.append('feedback_mode', feedbackMode);
+    }
 
     const res = await fetch(`${API_BASE}/grading/batch-zip`, {
       method: 'POST',
