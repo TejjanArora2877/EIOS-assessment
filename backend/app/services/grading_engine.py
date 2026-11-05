@@ -243,7 +243,7 @@ class GradingEngine:
         for i, s in enumerate(expanded_sents):
             prev = expanded_sents[i-1] if i > 0 else ""
             c = cls._clean_proposition(s, prev)
-            if c and not cls._is_administrative_sentence(c) and len(c.strip()) > 6:
+            if c and not cls._is_administrative_sentence(c) and len(c.strip()) > 6 and len(cls._extract_content_tokens(c)) > 0:
                 cleaned.append(c)
 
         # If all sentences were filtered or empty, fall back to cleaned whole description
@@ -266,7 +266,12 @@ class GradingEngine:
             "about", "which", "where", "when", "what", "into", "these", "other",
             "uses", "used", "using", "help", "helps", "well", "step", "steps",
             "answer", "student", "explain", "explains", "describe", "describes",
-            "states", "identifies", "defined", "defines", "including", "includes"
+            "states", "identifies", "defined", "defines", "including", "includes",
+            # Broad technical and generic domain stop words
+            "system", "systems", "data", "information", "service", "services",
+            "process", "processes", "approach", "approaches", "table", "tables",
+            "record", "records", "application", "applications", "consequence",
+            "consequences", "example", "examples", "portal", "key", "keys"
         }
         words = re.findall(r'[a-zA-Z]{3,}', text.lower())
         roots = set()
@@ -286,18 +291,18 @@ class GradingEngine:
     @classmethod
     def _extract_enumeration_items(cls, criterion_description: str) -> Tuple[List[str], bool]:
         """
-        Extracts illustrative list items (e.g. from 'such as X, Y, Z') and checks if proportional grading applies.
+        Extracts illustrative list items (e.g. from 'such as X, Y, Z' or 'applications in X, Y, Z') and checks if proportional grading applies.
         """
-        m = re.search(r'(?i)\b(such as|including|e\.g\.?,?|for example)\s+([^.]*)', criterion_description)
+        m = re.search(r'(?i)\b(such as|including|e\.g\.?,?|for example|applications in|tasks such as|tasks in|examples in)\s+([^.]*)', criterion_description)
         if not m:
             return [], False
 
         raw_list = m.group(2)
         raw_items = re.split(r',|\bor\b|\band\b', raw_list)
-        items = [re.sub(r'^\s*(such as|including|e\.g\.?)\s*', '', it).strip() for it in raw_items]
+        items = [re.sub(r'^\s*(such as|including|e\.g\.?|applications in)\s*', '', it).strip() for it in raw_items]
         items = [it for it in items if len(it) > 3]
 
-        is_proportional = bool(re.search(r'(?i)\b(proportionately|partial marks|number and relevance|list some)\b', criterion_description))
+        is_proportional = bool(items) and (len(items) >= 3 or bool(re.search(r'(?i)\b(proportionately|partial marks|number and relevance|list some|applications|examples|tasks)\b', criterion_description)))
         return items, is_proportional
 
     @classmethod
@@ -331,8 +336,8 @@ class GradingEngine:
             else:
                 missing.append(it)
 
-        # Benchmark: 4 items (or all items if total < 4) yields 100% full marks
-        target_benchmark = min(4, len(items))
+        # Benchmark: 3 items (or all items if total < 3) yields 100% full marks
+        target_benchmark = min(3, len(items))
         ratio = min(1.0, len(matched) / target_benchmark) if target_benchmark > 0 else 1.0
         return ratio, matched, missing
 
@@ -367,19 +372,24 @@ class GradingEngine:
         target_tokens = distinctive_prop_tokens if distinctive_prop_tokens is not None else (
             prop_tokens if prop_tokens is not None else cls._extract_content_tokens(prop)
         )
-        has_lexical_grounding = bool(tokens & target_tokens)
+        overlap = tokens & target_tokens
+        has_substantive_lexical = len(overlap) >= 2 or (len(overlap) >= 1 and len(target_tokens) <= 2)
+        has_partial_lexical = len(overlap) >= 1
 
         if sim is None:
             prop_emb = ModelsLoader.encode_texts([prop])[0]
             cand_emb = ModelsLoader.encode_texts([text])[0]
             sim = float(cosine_similarity([prop_emb], [cand_emb])[0][0])
 
-        # Require genuine conceptual relevance reusing established codebase thresholds:
-        # 1. Lexical grounding on distinctive domain vocabulary with sentence relevance floor (sim >= 0.30), OR
-        # 2. Strong semantic embedding affinity matching reverse-entailment threshold (sim >= 0.50)
-        if has_lexical_grounding and sim >= 0.30:
+        # Conceptual grounding requires either:
+        # a) Substantive domain lexical grounding (>= 2 distinctive tokens) with semantic floor (sim >= 0.35)
+        # b) Single distinctive token lexical match requiring moderate semantic affinity (sim >= 0.50)
+        # c) High semantic similarity (sim >= 0.68) specifically to the proposition when lexical grounding is absent
+        if has_substantive_lexical and sim >= 0.35:
             return True
-        if sim >= 0.50:
+        if has_partial_lexical and sim >= 0.50:
+            return True
+        if sim >= 0.68:
             return True
         return False
 
@@ -537,18 +547,18 @@ class GradingEngine:
         cite_tokens = set().union(*(cls._extract_content_tokens(cs) for cs in cite_snippets)) - q_tokens if cite_snippets else set()
         precomputed_cite_embs = ModelsLoader.encode_texts(cite_snippets) if cite_snippets else None
 
-        # Precompute embeddings of other criteria to enforce cross-criterion isolation
-        other_criteria_texts = []
+        # Precompute embeddings of other criteria and all assessment propositions for isolation
+        isolation_texts = []
         if all_criteria_descriptions:
             for cname, cdesc in all_criteria_descriptions.items():
                 if cname != criterion_name and cdesc and cdesc.strip():
-                    other_criteria_texts.append(cdesc)
+                    isolation_texts.append(cdesc)
         if all_assessment_props:
             for other_p in all_assessment_props:
-                if other_p not in target_propositions and len(other_p.strip()) > 5:
-                    other_criteria_texts.append(other_p)
+                if other_p and len(other_p.strip()) > 5 and other_p not in isolation_texts:
+                    isolation_texts.append(other_p)
 
-        other_criteria_embs = ModelsLoader.encode_texts(other_criteria_texts) if other_criteria_texts else None
+        isolation_embs = ModelsLoader.encode_texts(isolation_texts) if isolation_texts else None
 
         for prop in target_propositions:
             prop_emb = ModelsLoader.encode_texts([prop])[0]
@@ -557,10 +567,14 @@ class GradingEngine:
             best_sim = float(sims[best_idx])
             best_cand = candidate_windows[best_idx]
 
+            if isolation_embs is not None and len(isolation_texts) > 0:
+                active_indices = [idx for idx, t in enumerate(isolation_texts) if t != prop]
+                prop_other_embs = isolation_embs[active_indices] if active_indices else None
+            else:
+                prop_other_embs = None
+
             prop_tokens = cls._extract_content_tokens(prop)
             distinctive_prop_tokens = prop_tokens - q_tokens
-            if not distinctive_prop_tokens or len(distinctive_prop_tokens) < 2:
-                distinctive_prop_tokens = prop_tokens
 
             # Grounding against teacher's model answer:
             # Identify model answer statements aligned with this rubric proposition
@@ -600,6 +614,7 @@ class GradingEngine:
 
             fwd_pairs = [(candidate_windows[i], prop) for i in candidate_indices]
             fwd_results = ModelsLoader.predict_nli(fwd_pairs) if fwd_pairs else []
+            cand_prop_nli = {idx: res for idx, res in zip(candidate_indices, fwd_results)}
             best_ent_cand = best_cand
             best_ent_sim = best_sim
             valid_fwd_ents = []
@@ -636,7 +651,17 @@ class GradingEngine:
                         c_contra = r["contradiction"]
                         c_ent = r["entailment"]
                         is_invalid_ent = (c_ent < 0.40) and ((c_contra >= 0.70 and c_contra > c_ent) or (c_contra >= 0.60 and c_contra > c_ent and c_ent < 0.30))
-                        if not is_invalid_ent:
+
+                        # Verify against main proposition: candidate must not explicitly contradict the main proposition
+                        direct_r = cand_prop_nli.get(cand_i)
+                        if direct_r is None:
+                            direct_r = ModelsLoader.predict_nli([(candidate_windows[cand_i], prop)])[0]
+                            cand_prop_nli[cand_i] = direct_r
+                        neg_cand_regex = r'(?i)\b(never|not|no|neither|nor|cannot|can\'t|won\'t|doesn\'t|don\'t|discards?|avoids?|rejects?|without|fails?|false|incorrect|incompatible|inefficient)\b'
+                        is_cand_neg = bool(re.search(neg_cand_regex, candidate_windows[cand_i]))
+                        is_direct_prop_contra = is_cand_neg and bool(direct_r and (direct_r["contradiction"] >= 0.50 and direct_r["contradiction"] > direct_r["entailment"]))
+
+                        if not is_invalid_ent and not is_direct_prop_contra:
                             cand_to_prop_sim = float(sims[cand_i])
                             if cand_to_prop_sim >= 0.35 or cls._is_conceptually_related(candidate_windows[cand_i], prop, cand_to_prop_sim, augmented_distinctive_tokens, prop_tokens):
                                 if c_ent > best_fwd_ent:
@@ -666,89 +691,141 @@ class GradingEngine:
             is_concept_grounded = bool(
                 (best_ent_cand and cls._is_conceptually_related(best_ent_cand, prop, best_ent_sim, augmented_distinctive_tokens, prop_tokens))
                 or (best_cand and cls._is_conceptually_related(best_cand, prop, best_sim, augmented_distinctive_tokens, prop_tokens))
-                or (best_sim >= 0.50)
-                or (best_sim >= 0.30 and distinctive_ratio >= 0.45)
+                or (best_sim >= 0.68)
+                or (best_sim >= 0.45 and distinctive_ratio >= 0.40 and bool(distinctive_overlap))
             )
-
-            # c) Entailment Immunity: If ANY candidate window in the student submission successfully
-            # entails prop (ent_score >= 0.55 with conceptual grounding), that proposition is DEMONSTRATED.
-            # Non-matching sentences elsewhere in a 1000-word essay must NEVER wipe out a demonstrated concept!
-            is_prop_demonstrated = bool(ent_score >= 0.55 and is_concept_grounded)
 
             # 2. Contradiction check: unmask contradictions across candidate windows (both negated and affirmative misconceptions)
             is_contradiction = False
-            if not is_prop_demonstrated:
-                neg_regex = r'(?i)\b(never|not|no|neither|nor|cannot|can\'t|won\'t|doesn\'t|don\'t|discards?|avoids?|rejects?|without|fails?|false|incorrect|incompatible|inefficient)\b'
-                contra_candidates: List[Tuple[int, str]] = []
-                num_sentences = len(student_sentences)
+            is_prop_demonstrated = False
 
-                # 1. Inspect individual student sentences:
-                for s_idx in range(num_sentences):
-                    s_text = student_sentences[s_idx]
-                    s_sim = float(sims[s_idx]) if s_idx < len(sims) else None
-                    # a) High Lexical & Semantic Specificity: The candidate window has high direct semantic similarity (sim >= 0.55) specifically to prop AND shares content tokens with prop
-                    if s_sim is None or s_sim < 0.55:
+            # Verify if apparent high forward entailment is an affirmative misconception / inversion
+            if is_concept_grounded and (ent_score >= 0.55 or best_fwd_ent >= 0.65):
+                verify_cand = best_ent_cand or best_cand
+                if verify_cand:
+                    rev_check = ModelsLoader.predict_nli([(prop, verify_cand)])[0]
+                    if rev_check["contradiction"] >= 0.60 and rev_check["contradiction"] > rev_check["entailment"]:
+                        is_contradiction = True
+                        cand = verify_cand
+                        contradictions_found.append(
+                            f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
+                        )
+                    else:
+                        is_prop_demonstrated = True
+                else:
+                    is_prop_demonstrated = True
+            neg_regex = r'(?i)\b(never|not|no|neither|nor|cannot|can\'t|won\'t|doesn\'t|don\'t|discards?|avoids?|rejects?|fails?|false|incorrect|incompatible|inefficient|unnecessary|unneeded|pointless|interchangeable|same\s+thing)\b'
+            contra_candidates: List[Tuple[int, str]] = []
+            num_sentences = len(student_sentences)
+
+            # 1. Inspect individual student sentences:
+            for s_idx in range(num_sentences):
+                s_text = student_sentences[s_idx]
+                s_sim = float(sims[s_idx]) if s_idx < len(sims) else None
+                if s_sim is None:
+                    continue
+                s_tokens = cls._extract_content_tokens(s_text)
+                has_prop_overlap = bool(s_tokens & (prop_tokens | augmented_distinctive_tokens))
+                if not ((s_sim >= 0.45) or (s_sim >= 0.35 and has_prop_overlap)):
+                    continue
+                if not has_prop_overlap and s_sim < 0.55:
+                    continue
+
+                # d) Isolation from Other Criteria and Propositions: A sentence that aligns with a different criterion or proposition must NEVER be treated as a contradiction of the current proposition
+                if prop_other_embs is not None and len(prop_other_embs) > 0:
+                    s_emb = cand_embs[s_idx] if s_idx < len(cand_embs) else ModelsLoader.encode_texts([s_text])[0]
+                    other_sims = cosine_similarity([s_emb], prop_other_embs)[0]
+                    if len(other_sims) > 0 and float(other_sims.max()) >= s_sim:
                         continue
-                    s_tokens = cls._extract_content_tokens(s_text)
-                    if not bool(s_tokens & (prop_tokens | augmented_distinctive_tokens)):
+
+                contra_candidates.append((s_idx, s_text))
+
+            # 2. Inspect adjacent sentence pairs:
+            for j in range(num_sentences - 1):
+                pair_idx = num_sentences + j
+                if pair_idx < len(candidate_windows):
+                    pair_text = candidate_windows[pair_idx]
+                    pair_sim = float(sims[pair_idx]) if pair_idx < len(sims) else None
+                    if pair_sim is None:
+                        continue
+                    pair_tokens = cls._extract_content_tokens(pair_text)
+                    has_pair_overlap = bool(pair_tokens & (prop_tokens | augmented_distinctive_tokens))
+                    if not ((pair_sim >= 0.45) or (pair_sim >= 0.35 and has_pair_overlap)):
+                        continue
+                    if not has_pair_overlap and pair_sim < 0.55:
                         continue
 
-                    # d) Isolation from Other Criteria: A sentence that aligns with or entails a different criterion or model answer proposition must NEVER be treated as a contradiction of the current criterion
-                    if other_criteria_embs is not None and len(other_criteria_embs) > 0:
-                        s_emb = cand_embs[s_idx] if s_idx < len(cand_embs) else ModelsLoader.encode_texts([s_text])[0]
-                        other_sims = cosine_similarity([s_emb], other_criteria_embs)[0]
-                        if len(other_sims) > 0 and float(other_sims.max()) > s_sim:
+                    if prop_other_embs is not None and len(prop_other_embs) > 0:
+                        pair_emb = cand_embs[pair_idx] if pair_idx < len(cand_embs) else ModelsLoader.encode_texts([pair_text])[0]
+                        other_sims = cosine_similarity([pair_emb], prop_other_embs)[0]
+                        if len(other_sims) > 0 and float(other_sims.max()) >= pair_sim:
                             continue
 
-                    contra_candidates.append((s_idx, s_text))
+                    contra_candidates.append((pair_idx, pair_text))
 
-                # 2. Inspect adjacent sentence pairs:
-                for j in range(num_sentences - 1):
-                    pair_idx = num_sentences + j
-                    if pair_idx < len(candidate_windows):
-                        pair_text = candidate_windows[pair_idx]
-                        pair_sim = float(sims[pair_idx]) if pair_idx < len(sims) else None
-                        if pair_sim is None or pair_sim < 0.55:
+            if contra_candidates and not is_contradiction:
+                seen_cands = set()
+                unique_contra_candidates = []
+                for c_idx, c_text in contra_candidates:
+                    if c_text not in seen_cands:
+                        seen_cands.add(c_text)
+                        unique_contra_candidates.append((c_idx, c_text))
+
+                # Cap contradiction candidates to top 10
+                unique_contra_candidates = unique_contra_candidates[:10]
+
+                contra_pairs = [(c_text, prop) for _, c_text in unique_contra_candidates]
+                contra_results = ModelsLoader.predict_nli(contra_pairs) if contra_pairs else []
+                for (c_idx, c_text), r in zip(unique_contra_candidates, contra_results):
+                    c_contra = r["contradiction"]
+                    c_ent = r["entailment"]
+
+                    # If candidate has moderate forward entailment to prop, it expresses the concept, not contradicts it!
+                    if c_ent >= 0.35:
+                        continue
+
+                    is_explicit_neg = bool(re.search(neg_regex, c_text))
+
+                    # For enumerations/proportional criteria or list of examples:
+                    # An affirmative sentence providing examples or applications must NEVER be treated as a contradiction!
+                    # Only explicit negations can contradict an enumeration list.
+                    if (is_proportional or bool(enum_items)) and not is_explicit_neg:
+                        continue
+
+                    # Entailment Protection: If student successfully and unambiguously entails prop
+                    # in their submission (ent_score >= 0.55 with conceptual grounding),
+                    # that proposition is DEMONSTRATED. An affirmative sentence elsewhere in a multi-sentence
+                    # essay must NEVER wipe out a demonstrated concept! Only an explicit negation
+                    # with high contradiction can flag a demonstrated concept.
+                    if is_prop_demonstrated:
+                        c_tokens = cls._extract_content_tokens(c_text)
+                        target_tokens = prop_tokens | augmented_distinctive_tokens
+                        if len(c_tokens & target_tokens) >= 2:
                             continue
-                        pair_tokens = cls._extract_content_tokens(pair_text)
-                        if not bool(pair_tokens & (prop_tokens | augmented_distinctive_tokens)):
-                            continue
+                        if is_explicit_neg and c_contra >= 0.80 and c_contra > c_ent and c_ent < 0.15:
+                            is_contradiction = True
+                            cand = c_text
+                            contradictions_found.append(
+                                f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
+                            )
+                            break
+                        continue
 
-                        if other_criteria_embs is not None and len(other_criteria_embs) > 0:
-                            pair_emb = cand_embs[pair_idx] if pair_idx < len(cand_embs) else ModelsLoader.encode_texts([pair_text])[0]
-                            other_sims = cosine_similarity([pair_emb], other_criteria_embs)[0]
-                            if len(other_sims) > 0 and float(other_sims.max()) > pair_sim:
-                                continue
-
-                        contra_candidates.append((pair_idx, pair_text))
-
-                if contra_candidates:
-                    seen_cands = set()
-                    unique_contra_candidates = []
-                    for c_idx, c_text in contra_candidates:
-                        if c_text not in seen_cands:
-                            seen_cands.add(c_text)
-                            unique_contra_candidates.append((c_idx, c_text))
-
-                    # Cap contradiction candidates to top 10
-                    unique_contra_candidates = unique_contra_candidates[:10]
-
-                    contra_pairs = [(c_text, prop) for _, c_text in unique_contra_candidates]
-                    contra_results = ModelsLoader.predict_nli(contra_pairs) if contra_pairs else []
-                    for (c_idx, c_text), r in zip(unique_contra_candidates, contra_results):
-                        c_contra = r["contradiction"]
-                        c_ent = r["entailment"]
-
-                        # Respect conceptual alignment: if candidate has c_ent >= 0.40, do not flag as contradiction
-                        if c_ent >= 0.40:
-                            continue
-
-                        is_explicit_neg = bool(re.search(neg_regex, c_text))
-                        # b) Explicit Contradiction / Inversion: The NLI model outputs c_contra >= 0.75 and c_ent < 0.15 (or c_contra >= 0.65 with explicit negation keywords like "not", "never", "cannot", "does not use")
-                        is_high_conf = (c_contra >= 0.75 and c_ent < 0.15)
-                        is_neg_contra = (is_explicit_neg and c_contra >= 0.65 and c_contra > c_ent and c_ent < 0.20)
-
-                        if is_high_conf or is_neg_contra:
+                    # Otherwise, proposition was not strongly demonstrated:
+                    if is_explicit_neg:
+                        if c_contra >= 0.55 and c_contra > c_ent:
+                            is_contradiction = True
+                            cand = c_text
+                            contradictions_found.append(
+                                f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
+                            )
+                            break
+                    else:
+                        # Affirmative misconception: requires genuine reverse contradiction (Prop -> Cand)
+                        # proving the student statement is incompatible with the rubric proposition,
+                        # avoiding spurious forward NLI penalties on cross-criterion or partial answers.
+                        rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
+                        if rev_nli["contradiction"] >= 0.70 and rev_nli["contradiction"] > rev_nli["entailment"] and rev_nli["entailment"] < 0.25:
                             is_contradiction = True
                             cand = c_text
                             contradictions_found.append(
@@ -758,16 +835,23 @@ class GradingEngine:
 
             # 4. Citation evidence verification: check lexical and semantic support from retrieved textbook citations
             has_citation_verification = False
-            if precomputed_cite_embs is not None and len(cite_snippets) > 0 and is_concept_grounded and not is_contradiction:
+            if (
+                precomputed_cite_embs is not None
+                and len(cite_snippets) > 0
+                and is_concept_grounded
+                and not is_contradiction
+                and ent_score >= 0.35
+            ):
                 eval_cand_text = best_ent_cand or best_cand or student_text
                 cand_tokens = cls._extract_content_tokens(eval_cand_text)
-                cite_token_overlap = cand_tokens & cite_tokens
+                cite_distinctive_tokens = cite_tokens & (augmented_distinctive_tokens if augmented_distinctive_tokens else prop_tokens)
+                cite_token_overlap = cand_tokens & cite_distinctive_tokens
 
                 cand_emb_single = ModelsLoader.encode_texts([eval_cand_text])[0]
                 cite_sims = cosine_similarity([cand_emb_single], precomputed_cite_embs)[0]
                 max_cite_sim = float(cite_sims.max()) if len(cite_sims) > 0 else 0.0
 
-                if len(cite_token_overlap) >= 2 or max_cite_sim >= 0.55:
+                if max_cite_sim >= 0.55 and len(cite_token_overlap) >= 2:
                     has_citation_verification = True
 
             if is_contradiction:
@@ -783,8 +867,7 @@ class GradingEngine:
                     base_mult = min(1.0, 0.50 + 0.50 * max(ent_score, fuzzy, distinctive_ratio))
                     p_mult = 1.0 if has_citation_verification else base_mult
                 else:
-                    base_mult = min(0.35, ent_score * 0.8)
-                    p_mult = 0.85 if has_citation_verification else base_mult
+                    p_mult = 0.0
             else:
                 if is_concept_grounded and best_sim >= 0.85 and distinctive_ratio >= 0.75:
                     p_mult = 0.50 if has_citation_verification else 0.25

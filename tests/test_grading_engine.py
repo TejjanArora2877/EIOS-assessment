@@ -1306,3 +1306,107 @@ def test_regression_mbl_student_a_beats_or_equals_student_b(monkeypatch, dummy_c
     # 5. Student A has zero contradictions
     assert all(len(c.contradictions_detected) == 0 for c in res_a.criterion_breakdown)
     assert res_a.requires_teacher_review is False
+
+
+def _load_security_fixture():
+    import os, json
+    fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "security_fixtures.json")
+    with open(fixture_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    plan = data["assessment"]
+    criteria = [
+        RubricCriterionResponse(
+            id=f"sec-crit-{i+1}",
+            order_index=i + 1,
+            name=c["name"],
+            description=c["description"],
+            max_marks=c["max_marks"]
+        )
+        for i, c in enumerate(plan["criteria"])
+    ]
+    assessment = AssessmentResponse(
+        id="test-security-foundations",
+        title=plan["title"],
+        question=plan["question"],
+        model_answer=plan.get("model_answer"),
+        total_marks=plan["total_marks"],
+        doc_scope="ALL",
+        criteria=criteria,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z"
+    )
+    return assessment, data["students"]
+
+
+def test_regression_security_student_d_sql_joins_zero_credit(monkeypatch, dummy_citations):
+    """
+    Verifies that Student D's completely irrelevant answer about SQL joins and
+    relational database design receives 0 marks (<= 1.00/20.00) on the Security assessment,
+    with zero false positive credit leakage and no spurious teacher review flags.
+    """
+    assessment, students = _load_security_fixture()
+    text_d = students["Student_D_Irrelevant_SQL_Joins.txt"]
+
+    res_d = GradingEngine.grade_submission(
+        assessment=assessment,
+        student_text=text_d,
+        feedback_mode="none"
+    )
+
+    assert res_d.total_score <= 1.0, f"Expected Student D <= 1.00, got {res_d.total_score}"
+    assert res_d.total_score == 0.0, f"Expected Student D target 0.00, got {res_d.total_score}"
+    assert res_d.requires_teacher_review is False
+
+
+def test_regression_security_student_e_contradictions_penalized(monkeypatch, dummy_citations):
+    """
+    Verifies that Student E's contradictory answer containing explicit security misconceptions
+    and inverted definitions is heavily penalized (<= 6.00/20.00, target <= 5.00),
+    detects multiple contradictions, and flags requires_teacher_review as True.
+    """
+    assessment, students = _load_security_fixture()
+    text_e = students["Student_E_Contradictory.txt"]
+
+    res_e = GradingEngine.grade_submission(
+        assessment=assessment,
+        student_text=text_e,
+        feedback_mode="none"
+    )
+
+    assert res_e.total_score <= 6.0, f"Expected Student E <= 6.00, got {res_e.total_score}"
+    assert res_e.total_score <= 5.0, f"Expected Student E <= 5.00, got {res_e.total_score}"
+    assert res_e.requires_teacher_review is True
+    total_contras = sum(len(cb.contradictions_detected) for cb in res_e.criterion_breakdown)
+    assert total_contras >= 3, f"Expected at least 3 contradictions detected, got {total_contras}"
+
+
+def test_regression_security_student_a_and_b_retain_high_marks(monkeypatch, dummy_citations):
+    """
+    Verifies that high-performing students (Student A: complete, Student B: paraphrase)
+    retain high marks (>= 18.00/20.00) with requires_teacher_review is False and
+    zero false-positive contradictions detected.
+    """
+    assessment, students = _load_security_fixture()
+    text_a = students["Student_A_Complete.txt"]
+    text_b = students["Student_B_Paraphrase.txt"]
+
+    res_a = GradingEngine.grade_submission(
+        assessment=assessment,
+        student_text=text_a,
+        feedback_mode="none"
+    )
+    res_b = GradingEngine.grade_submission(
+        assessment=assessment,
+        student_text=text_b,
+        feedback_mode="none"
+    )
+
+    # Student A
+    assert res_a.total_score >= 18.0, f"Expected Student A >= 18.00, got {res_a.total_score}"
+    assert res_a.requires_teacher_review is False
+    assert all(len(cb.contradictions_detected) == 0 for cb in res_a.criterion_breakdown)
+
+    # Student B
+    assert res_b.total_score >= 18.0, f"Expected Student B >= 18.00, got {res_b.total_score}"
+    assert res_b.requires_teacher_review is False
+    assert all(len(cb.contradictions_detected) == 0 for cb in res_b.criterion_breakdown)
