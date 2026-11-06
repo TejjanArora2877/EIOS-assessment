@@ -538,6 +538,7 @@ class GradingEngine:
         contradictions_found = []
         missing_concepts = []
         present_concepts = []
+        matched_excerpt_windows: List[str] = []
 
         q_tokens = cls._extract_content_tokens(question)
         student_tokens = cls._extract_content_tokens(student_text)
@@ -821,17 +822,23 @@ class GradingEngine:
                             )
                             break
                     else:
-                        # Affirmative misconception: requires genuine reverse contradiction (Prop -> Cand)
-                        # proving the student statement is incompatible with the rubric proposition,
-                        # avoiding spurious forward NLI penalties on cross-criterion or partial answers.
-                        rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
-                        if rev_nli["contradiction"] >= 0.70 and rev_nli["contradiction"] > rev_nli["entailment"] and rev_nli["entailment"] < 0.25:
+                        # Affirmative misconception: high-confidence forward contradiction OR reverse contradiction
+                        if c_contra >= 0.75 and c_contra > c_ent and c_ent < 0.15:
                             is_contradiction = True
                             cand = c_text
                             contradictions_found.append(
                                 f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
                             )
                             break
+                        else:
+                            rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
+                            if rev_nli["contradiction"] >= 0.70 and rev_nli["contradiction"] > rev_nli["entailment"] and rev_nli["entailment"] < 0.25:
+                                is_contradiction = True
+                                cand = c_text
+                                contradictions_found.append(
+                                    f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
+                                )
+                                break
 
             # 4. Citation evidence verification: check lexical and semantic support from retrieved textbook citations
             has_citation_verification = False
@@ -876,8 +883,13 @@ class GradingEngine:
 
             if is_contradiction:
                 missing_concepts.append(prop)
+                if cand:
+                    matched_excerpt_windows.append(cand)
             elif p_mult >= 0.50:
                 present_concepts.append(prop)
+                cand_to_save = best_ent_cand or best_cand
+                if cand_to_save:
+                    matched_excerpt_windows.append(cand_to_save)
             else:
                 missing_concepts.append(prop)
 
@@ -895,8 +907,17 @@ class GradingEngine:
             missing_concepts = [m for m in missing_concepts if not any(it.lower() in m.lower() for it in enum_items[:2])]
             if matched_items:
                 present_concepts.append(f"Valid items identified: {', '.join(matched_items)}")
+                for item in matched_items:
+                    for s in student_sentences:
+                        if item.lower() in s.lower():
+                            matched_excerpt_windows.append(s)
             if missing_items and len(matched_items) < 4:
-                missing_concepts.append(f"Additional applications: {', '.join(missing_items[:3])}")
+                missing_str = LLMFeedbackService._format_missing_concepts(
+                    missing_items=missing_items[:3],
+                    criterion_name=criterion_name,
+                    criterion_description=criterion_description
+                )
+                missing_concepts.append(missing_str)
             feedback_target_props = [f"Identifies valid {criterion_name} tasks or applications (such as {', '.join(matched_items[:3] if matched_items else enum_items[:3])})"]
         else:
             semantic_coverage = prop_coverage
@@ -934,7 +955,21 @@ class GradingEngine:
 
         # Ensure relevant_excerpt is established if not provided
         if relevant_excerpt is None:
-            if len(student_sentences) > 2 and target_propositions:
+            if matched_excerpt_windows:
+                seen_excerpts = set()
+                unique_excerpts = []
+                for ex in matched_excerpt_windows:
+                    ex_clean = ex.strip()
+                    if ex_clean and ex_clean not in seen_excerpts:
+                        seen_excerpts.add(ex_clean)
+                        unique_excerpts.append(ex_clean)
+                combined = " ".join(unique_excerpts)
+                combined_words = combined.split()
+                if len(combined_words) > 200:
+                    relevant_excerpt = " ".join(combined_words[:200])
+                else:
+                    relevant_excerpt = combined
+            elif len(student_sentences) > 2 and target_propositions:
                 matched_s_indices = set()
                 sent_embs = cand_embs[:len(student_sentences)]
                 for prop in target_propositions:
@@ -944,23 +979,62 @@ class GradingEngine:
                     if sims[best_s_idx] >= 0.30:
                         matched_s_indices.add(best_s_idx)
                 if matched_s_indices:
-                    relevant_excerpt = " ".join([student_sentences[i] for i in sorted(matched_s_indices)])
+                    matched_s = [student_sentences[i] for i in sorted(matched_s_indices)]
+                    combined = " ".join(matched_s)
+                    combined_words = combined.split()
+                    if len(combined_words) > 200:
+                        relevant_excerpt = " ".join(combined_words[:200])
+                    else:
+                        relevant_excerpt = combined
+                else:
+                    relevant_excerpt = ""
+            else:
+                student_words = student_text.split()
+                if len(student_words) > 200:
+                    relevant_excerpt = " ".join(student_words[:200])
                 else:
                     relevant_excerpt = student_text
-            else:
-                relevant_excerpt = student_text
 
         t_score_ms = (time.perf_counter() - t_score0) * 1000
 
         # LLM Feedback generation
         t_fb0 = time.perf_counter()
         crit_fb_stats = {}
+        is_hybrid_or_default = feedback_mode is None or feedback_mode.lower() == "hybrid"
         if feedback_mode == "none":
             feedback = ""
             crit_fb_stats = {
                 "ollama_called": False,
                 "duration_ms": 0.0,
                 "mode": "none"
+            }
+        elif is_hybrid_or_default and awarded_marks == 0.0 and not contradictions_found and (not relevant_excerpt or not present_concepts):
+            is_sub_irrelevant = LLMFeedbackService._is_submission_irrelevant(
+                student_text=student_text,
+                question=question,
+                all_criteria_descriptions=all_criteria_descriptions
+            )
+            if is_sub_irrelevant:
+                feedback = f"The submitted response does not address the expected concepts for '{criterion_name}'."
+            else:
+                clean_m = []
+                for m in missing_concepts:
+                    m_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', m).strip(' ,;-')
+                    if m_clean and m_clean not in clean_m:
+                        clean_m.append(m_clean)
+                if not clean_m and target_propositions:
+                    for tp in target_propositions:
+                        tp_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', tp).strip(' ,;-')
+                        if tp_clean and tp_clean not in clean_m:
+                            clean_m.append(tp_clean)
+                if not clean_m:
+                    clean_m = [criterion_description]
+                missing_concepts_str = "; ".join(clean_m[:2])
+                feedback = f"The response does not address '{criterion_name}'. Expected concepts to address: {missing_concepts_str}."
+            crit_fb_stats = {
+                "ollama_called": False,
+                "duration_ms": 0.0,
+                "deterministic_reason": "zero_marks_unaddressed"
             }
         else:
             feedback = LLMFeedbackService.generate_criterion_feedback(

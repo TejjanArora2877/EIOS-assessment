@@ -383,3 +383,107 @@ def test_feedback_mode_none_score_only(sample_assessment):
     assert api_data["provenance"]["feedback_mode"] == "none"
     assert api_data["provenance"]["ollama_calls"] == 0
     assert api_data["provenance"]["stage_durations"]["feedback_generation_ms"] == 0.0
+
+
+def test_clean_feedback_text_strips_preambles():
+    """
+    Verifies that _clean_feedback_text cleanly strips conversational preambles
+    such as 'Here is the feedback:', 'Feedback:', 'Evaluation:', and 'Constructive feedback:'.
+    """
+    # 1. 'Here is the feedback:'
+    raw_1 = "Here is the feedback: The student correctly identified asymmetric encryption."
+    assert LLMFeedbackService._clean_feedback_text(raw_1) == "The student correctly identified asymmetric encryption."
+
+    # 2. 'Feedback:'
+    raw_2 = "Feedback: The student accurately explained the difference between passive and active attacks."
+    assert LLMFeedbackService._clean_feedback_text(raw_2) == "The student accurately explained the difference between passive and active attacks."
+
+    # 3. 'Evaluation:'
+    raw_3 = "Evaluation: The answer lacks key distribution details."
+    assert LLMFeedbackService._clean_feedback_text(raw_3) == "The answer lacks key distribution details."
+
+    # 4. 'Constructive feedback:'
+    raw_4 = "Constructive feedback: Consider clarifying how public keys are verified."
+    assert LLMFeedbackService._clean_feedback_text(raw_4) == "Consider clarifying how public keys are verified."
+
+    # 5. Text without preamble is untouched
+    raw_5 = "The student demonstrated sound reasoning throughout the answer."
+    assert LLMFeedbackService._clean_feedback_text(raw_5) == "The student demonstrated sound reasoning throughout the answer."
+
+
+def test_clean_feedback_text_strips_echoed_rubric():
+    """
+    Verifies that when an LLM echoes the rubric description or criterion prompt
+    before 'Feedback:' or 'Evaluation:', the echoed prefix is removed and only
+    the evaluative feedback is retained.
+    """
+    raw = (
+        "Passive attacks are distinguished from active attacks because they monitor traffic without alteration. "
+        "Feedback: The student accurately explained passive attacks but omitted active attack mechanisms."
+    )
+    cleaned = LLMFeedbackService._clean_feedback_text(raw)
+    assert cleaned == "The student accurately explained passive attacks but omitted active attack mechanisms."
+    assert not cleaned.startswith("Passive attacks are distinguished")
+
+    raw_eval = (
+        "Target Rubric Requirement: Encryption cannot prevent traffic analysis. "
+        "Evaluation: The student correctly noted that packet headers and volumes remain observable."
+    )
+    cleaned_eval = LLMFeedbackService._clean_feedback_text(raw_eval)
+    assert cleaned_eval == "The student correctly noted that packet headers and volumes remain observable."
+
+
+def test_dynamic_enumeration_labels():
+    """
+    Verifies dynamic enumeration label formatting:
+    - If criterion name or description mentions 'application', uses 'Additional applications:'.
+    - Otherwise, uses domain-neutral 'Missing elements:' (or 'Expected concepts:').
+    """
+    items = ["digital signatures", "hash functions", "access control"]
+
+    # 1. Application-focused criterion
+    label_app = LLMFeedbackService._format_missing_concepts(
+        missing_items=items,
+        criterion_name="NLP applications",
+        criterion_description="Lists valid applications of NLP models."
+    )
+    assert label_app.startswith("Additional applications:")
+    assert "digital signatures" in label_app
+
+    # 2. Non-application criterion (e.g. security mechanisms)
+    label_mech = LLMFeedbackService._format_missing_concepts(
+        missing_items=items,
+        criterion_name="Security mechanisms",
+        criterion_description="Identifies specific security mechanisms such as encryption and hashing."
+    )
+    assert not label_mech.startswith("Additional applications:")
+    assert label_mech.startswith("Missing elements:") or label_mech.startswith("Expected concepts:")
+    assert "digital signatures" in label_mech
+
+    # 3. Empty items returns empty string
+    assert LLMFeedbackService._format_missing_concepts([]) == ""
+
+
+def test_deterministic_zero_mark_criterion_feedback():
+    """
+    Verifies that a zero-mark criterion without contradictions or relevant text
+    returns the standardized deterministic template:
+    'The response does not address \'{criterion_name}\'. Expected concepts to address: {missing_concepts_str}.'
+    """
+    fb = LLMFeedbackService.generate_criterion_feedback(
+        question="Explain network security mechanisms and services.",
+        criterion_name="Security Services",
+        criterion_description="Explains confidentiality, integrity, and availability services.",
+        awarded_marks=0.0,
+        max_marks=5.0,
+        student_text="Network security mechanisms include packet filtering firewalls to monitor traffic.",
+        contradictions=[],
+        missing_concepts=["Confidentiality service", "Integrity service"],
+        citations=[],
+        present_concepts=[],
+        relevant_excerpt="",
+        feedback_mode="hybrid"
+    )
+    assert "The response does not address 'Security Services'" in fb
+    assert "Expected concepts to address: Confidentiality service; Integrity service." in fb
+    assert fb.endswith(".")

@@ -342,6 +342,58 @@ class LLMFeedbackService:
             return f"Partially addressed for {c_label} based on the rubric criteria."
 
     @classmethod
+    def _clean_feedback_text(cls, text: str) -> str:
+        """
+        Sanitizes feedback text by stripping conversational preambles and echoed prompt text.
+        """
+        if not text:
+            return ""
+        s = text.strip()
+
+        # If the model echoed the rubric description or criterion prompt prior to the word "Feedback:" or "Evaluation:",
+        # split on (?:feedback|evaluation):\s* and keep only the post-label evaluative feedback.
+        match_marker = re.search(r'(?i)\b(?:feedback|evaluation):\s*', s)
+        if match_marker:
+            post_text = s[match_marker.end():].strip()
+            if post_text:
+                s = post_text
+
+        # Strip leading phrases matching conversational preambles (case-insensitive)
+        s = re.sub(
+            r'(?i)^(?:here\s+is\s+(?:the\s+)?feedback:?|feedback:?|evaluation:?|constructive\s+feedback:?)\s*',
+            '',
+            s
+        ).strip()
+
+        # Strip enclosing quotes if generated with them
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            s = s[1:-1].strip()
+
+        return s
+
+    @classmethod
+    def _format_missing_concepts(
+        cls,
+        missing_items: List[str],
+        criterion_name: str = "",
+        criterion_description: str = "",
+        default_label: str = "Missing elements:"
+    ) -> str:
+        """
+        Formats missing enumeration items with a context-appropriate label.
+        Uses 'Additional applications:' if the criterion name or description contains 'application',
+        otherwise uses 'Missing elements:' or 'Expected concepts:'.
+        """
+        if not missing_items:
+            return ""
+        crit_text = f"{criterion_name} {criterion_description}".lower()
+        if "application" in crit_text:
+            label = "Additional applications:"
+        else:
+            label = default_label
+        return f"{label} {', '.join(missing_items)}"
+
+    @classmethod
     def generate_criterion_feedback(
         cls,
         question: str,
@@ -404,6 +456,11 @@ class LLMFeedbackService:
         else:
             eval_student_text = student_text
 
+        # Enforce input context pruning ceiling (~200 words max)
+        eval_words = eval_student_text.split()
+        if len(eval_words) > 200:
+            eval_student_text = " ".join(eval_words[:200]) + "..."
+
         has_no_statements = (
             not eval_student_text
             or eval_student_text == "[No statements addressing this criterion were identified in the student's submission]"
@@ -414,6 +471,37 @@ class LLMFeedbackService:
             question=question,
             all_criteria_descriptions=all_criteria_descriptions
         )
+
+        # Strict deterministic routing for zero-mark criteria:
+        # If a criterion earns 0 marks and has no detected contradictions or relevant text,
+        # bypass Ollama and return the deterministic template instantly.
+        if effective_mode == "hybrid" and is_zero and not clean_contradictions and (has_no_statements or sub_irrelevant or not clean_present):
+            if sub_irrelevant:
+                zero_fb = f"The submitted response does not address the expected concepts for '{criterion_name}'."
+            else:
+                clean_m = []
+                for m in clean_missing:
+                    m_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', m).strip(' ,;-')
+                    if m_clean and m_clean not in clean_m:
+                        clean_m.append(m_clean)
+                if not clean_m and target_propositions:
+                    for tp in target_propositions:
+                        tp_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', tp).strip(' ,;-')
+                        if tp_clean and tp_clean not in clean_m:
+                            clean_m.append(tp_clean)
+                if not clean_m:
+                    clean_m = [criterion_description]
+                missing_concepts_str = "; ".join(clean_m[:2])
+                zero_fb = f"The response does not address '{criterion_name}'. Expected concepts to address: {missing_concepts_str}."
+            if feedback_stats is not None:
+                feedback_stats["ollama_called"] = False
+                feedback_stats["deterministic_reason"] = "zero_marks_unaddressed"
+                feedback_stats["duration_ms"] = 0.0
+            logger.info(
+                f"[LLM Feedback] criterion='{criterion_name}' marks={awarded_marks:.2f}/{max_marks:.2f} "
+                f"duration_ms=0.0 mode={effective_mode} (strict deterministic zero-mark routing applied)"
+            )
+            return zero_fb
 
         # Safe hybrid feedback strategy:
         # Avoid expensive LLM generation when the evaluation result is deterministic and unambiguous
@@ -579,14 +667,16 @@ class LLMFeedbackService:
         ]
 
         base_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are an objective academic evaluator providing constructive feedback on an exam criterion.
-Rules:
-1. Respond strictly in 1 or 2 concise, factual sentences addressed directly to the student.
-2. Focus EXCLUSIVELY on evaluating '{criterion_name}' and its expected concepts. Do NOT discuss or evaluate concepts belonging to other criteria.
-3. Adhere strictly to the instruction in the DIRECTIVE block.
-4. Do NOT invent missing concepts or contradictions not present in the Evaluation Findings.
-5. Do NOT enumerate or repeat long lists of examples, applications, or tasks. Missing concepts and contradictions are displayed in separate UI sections; keep feedback concise and complete.
-6. Do NOT output greetings, headings, or conversational filler.
+You are an expert academic evaluator. Provide direct, objective, constructive feedback in 2-3 sentences.
+RULES:
+- Do NOT write conversational preambles (NEVER say 'Here is the feedback', 'Feedback:', or 'The student should know').
+- Do NOT repeat or summarize the rubric definition or criterion instructions.
+- Begin directly with what the student demonstrated and what is missing or incorrect.
+- Focus EXCLUSIVELY on evaluating '{criterion_name}' and its expected concepts. Do NOT discuss or evaluate concepts belonging to other criteria.
+- Adhere strictly to the instruction in the DIRECTIVE block.
+- Do NOT invent missing concepts or contradictions not present in the Evaluation Findings.
+- Do NOT enumerate or repeat long lists of examples, applications, or tasks. Missing concepts and contradictions are displayed in separate UI sections; keep feedback concise and complete.
+- Do NOT output greetings, headings, or conversational filler.
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 Question: {question}
 Assessed Criterion: {criterion_name}
@@ -608,11 +698,11 @@ Evaluation Findings for '{criterion_name}':
 - Missing concepts: {'; '.join(clean_missing) if clean_missing else 'None'}
 {evidence_context}
 
-Provide 1-2 concise, constructive feedback sentences for the student adhering to the DIRECTIVE:
+Provide 2-3 concise, constructive feedback sentences for the student adhering to the DIRECTIVE:
 <|eot_id|><|start_header_id|>assistant<|end_header_id|>
 """
 
-        # Attempt bounded generation with local LLM (num_predict=112 for complete, concise feedback)
+        # Attempt bounded generation with local LLM (num_predict=120 for complete, concise feedback)
         t_start = time.perf_counter()
         gen_duration_ms = 0.0
         ollama_status = None
@@ -632,9 +722,9 @@ Provide 1-2 concise, constructive feedback sentences for the student adhering to
                     "prompt": base_prompt,
                     "stream": False,
                     "options": {
-                        "temperature": 0.1,
+                        "temperature": 0.2,
                         "top_p": 0.9,
-                        "num_predict": 112
+                        "num_predict": 120
                     }
                 }
             )
@@ -643,6 +733,7 @@ Provide 1-2 concise, constructive feedback sentences for the student adhering to
             if response.status_code == 200:
                 resp_data = response.json()
                 candidate_feedback = resp_data.get("response", "").strip()
+                candidate_feedback = cls._clean_feedback_text(candidate_feedback)
                 prompt_tokens = resp_data.get("prompt_eval_count", 0)
                 eval_tokens = resp_data.get("eval_count", 0)
                 if cls._is_feedback_consistent(
