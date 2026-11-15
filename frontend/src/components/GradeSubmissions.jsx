@@ -618,9 +618,10 @@ export default function GradeSubmissions({
         <div
           className="batch-breakdown-modal-backdrop"
           onClick={() => setSelectedBatchItem(null)}
+          style={{ padding: '0.75rem' }}
         >
           <div
-            className="batch-breakdown-modal-dialog"
+            className="batch-breakdown-modal-dialog w-full max-w-none"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex-between" style={{ marginBottom: '1rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.75rem' }}>

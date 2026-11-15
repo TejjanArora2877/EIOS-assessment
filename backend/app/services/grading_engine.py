@@ -304,6 +304,10 @@ class GradingEngine:
             "uses", "used", "using", "help", "helps", "well", "step", "steps",
             "answer", "student", "explain", "explains", "describe", "describes",
             "states", "identifies", "defined", "defines", "including", "includes",
+            # Grammatical conjunctions, prepositions, copula, auxiliaries
+            "and", "the", "are", "is", "was", "were", "been", "being", "not",
+            "while", "why", "how", "can", "will", "may", "might", "shall",
+            "leave", "leaves", "leaving", "left", "without", "between", "through",
             # Broad technical and generic domain stop words
             "system", "systems", "data", "information", "service", "services",
             "process", "processes", "approach", "approaches", "table", "tables",
@@ -406,12 +410,17 @@ class GradingEngine:
             return False
 
         tokens = cls._extract_content_tokens(text)
-        target_tokens = distinctive_prop_tokens if distinctive_prop_tokens is not None else (
-            prop_tokens if prop_tokens is not None else cls._extract_content_tokens(prop)
-        )
-        overlap = tokens & target_tokens
-        has_substantive_lexical = len(overlap) >= 2 or (len(overlap) >= 1 and len(target_tokens) <= 2)
-        has_partial_lexical = len(overlap) >= 1
+        prop_toks = prop_tokens if prop_tokens is not None else cls._extract_content_tokens(prop)
+        dist_toks = distinctive_prop_tokens if distinctive_prop_tokens is not None else prop_toks
+
+        dist_overlap = tokens & dist_toks
+        base_dist_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in dist_overlap}
+        has_substantive_dist = len(base_dist_overlap) >= 2 or (len(base_dist_overlap) >= 1 and len(dist_toks) <= 2)
+        has_partial_dist = len(base_dist_overlap) >= 1
+
+        prop_overlap = tokens & prop_toks
+        base_prop_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in prop_overlap}
+        has_substantive_prop = len(base_prop_overlap) >= 2 or (len(base_prop_overlap) >= 1 and len(prop_toks) <= 2)
 
         if sim is None:
             prop_emb = ModelsLoader.encode_texts([prop])[0]
@@ -421,10 +430,13 @@ class GradingEngine:
         # Conceptual grounding requires either:
         # a) Substantive domain lexical grounding (>= 2 distinctive tokens) with semantic floor (sim >= 0.35)
         # b) Single distinctive token lexical match requiring moderate semantic affinity (sim >= 0.50)
-        # c) High semantic similarity (sim >= 0.68) specifically to the proposition when lexical grounding is absent
-        if has_substantive_lexical and sim >= 0.35:
+        # c) Substantive proposition lexical match (>= 2 prop tokens) with semantic floor (sim >= 0.30)
+        # d) High semantic similarity (sim >= 0.68) specifically to the proposition when lexical grounding is absent
+        if has_substantive_dist and sim >= 0.35:
             return True
-        if has_partial_lexical and sim >= 0.50:
+        if has_partial_dist and sim >= 0.50:
+            return True
+        if has_substantive_prop and sim >= 0.30:
             return True
         if sim >= 0.68:
             return True
@@ -682,7 +694,8 @@ class GradingEngine:
                         fwd_pairs_to_batch.append((candidate_windows[i], mp))
                         fwd_pairs_to_batch.append((candidate_windows[i], prop))
 
-            # Contradiction candidates
+            neg_regex = r'(?i)\b(never|not|no|neither|nor|cannot|can\'t|won\'t|doesn\'t|don\'t|discards?|avoids?|rejects?|fails?|false|incorrect|incompatible|inefficient|unnecessary|unneeded|pointless|interchangeable|same\s+thing)\b'
+            # Contradiction candidates (evaluated only on atomic individual sentences)
             contra_candidates: List[Tuple[int, str]] = []
             for s_idx in range(num_sentences):
                 s_text = student_sentences[s_idx]
@@ -690,59 +703,50 @@ class GradingEngine:
                 if s_sim is None:
                     continue
                 s_tokens = cls._extract_content_tokens(s_text)
-                has_prop_overlap = bool(s_tokens & (prop_tokens | augmented_distinctive_tokens))
-                if not ((s_sim >= 0.45) or (s_sim >= 0.35 and has_prop_overlap)):
+                has_prop_overlap = bool(s_tokens & (prop_tokens | distinctive_prop_tokens))
+                if not ((s_sim >= 0.45) or (s_sim >= 0.28 and has_prop_overlap)):
                     continue
                 if not has_prop_overlap and s_sim < 0.55:
                     continue
 
+                # Rule 2A: Never evaluate contradiction if candidate is not conceptually grounded in proposition
+                if not cls._is_conceptually_related(s_text, prop, s_sim, distinctive_prop_tokens, prop_tokens):
+                    continue
+
                 s_emb = cand_embs[s_idx] if s_idx < len(cand_embs) else ModelsLoader.encode_texts([s_text])[0]
 
-                # Intra-Criterion Cross-Proposition Affinity Guard:
-                # If candidate is significantly more similar to a sibling proposition within the same criterion,
-                # skip contradiction checking as it addresses that sibling subtopic.
+                # Intra-Criterion Cross-Proposition Affinity Guard (Rule 2B):
+                # If candidate is more similar to a sibling proposition within the same criterion,
+                # only skip if candidate has no lexical overlap with this proposition and is significantly more similar to the sibling
                 if sibling_prop_embs is not None and len(sibling_prop_embs) > 0:
                     other_prop_sims = cosine_similarity([s_emb], sibling_prop_embs)[0]
-                    if len(other_prop_sims) > 0 and float(other_prop_sims.max()) > s_sim + 0.10:
+                    if len(other_prop_sims) > 0 and not has_prop_overlap and float(other_prop_sims.max()) > s_sim + 0.12:
                         continue
 
                 # Cross-criterion isolation
+                if not bool(re.search(neg_regex, s_text)) and all_criteria_descriptions:
+                    has_other_crit_exclusive = False
+                    current_crit_toks = cls._extract_content_tokens(criterion_description)
+                    for other_cname, other_cdesc in all_criteria_descriptions.items():
+                        if other_cname != criterion_name and other_cdesc and other_cdesc.strip():
+                            other_crit_toks = cls._extract_content_tokens(other_cdesc)
+                            exclusive_toks = other_crit_toks - current_crit_toks
+                            if len(s_tokens & exclusive_toks) >= 1:
+                                dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
+                                overlap = s_tokens & dist_prop_toks
+                                base_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in overlap}
+                                if len(base_overlap) < 2:
+                                    has_other_crit_exclusive = True
+                                    break
+                    if has_other_crit_exclusive:
+                        continue
+
                 if prop_other_embs is not None and len(prop_other_embs) > 0:
                     other_sims = cosine_similarity([s_emb], prop_other_embs)[0]
-                    if len(other_sims) > 0 and float(other_sims.max()) >= s_sim:
+                    if len(other_sims) > 0 and not has_prop_overlap and float(other_sims.max()) >= s_sim:
                         continue
 
                 contra_candidates.append((s_idx, s_text))
-
-            for j in range(num_sentences - 1):
-                pair_idx = num_sentences + j
-                if pair_idx < len(candidate_windows):
-                    pair_text = candidate_windows[pair_idx]
-                    pair_sim = float(sims[pair_idx]) if pair_idx < len(sims) else None
-                    if pair_sim is None:
-                        continue
-                    pair_tokens = cls._extract_content_tokens(pair_text)
-                    has_pair_overlap = bool(pair_tokens & (prop_tokens | augmented_distinctive_tokens))
-                    if not ((pair_sim >= 0.45) or (pair_sim >= 0.35 and has_pair_overlap)):
-                        continue
-                    if not has_pair_overlap and pair_sim < 0.55:
-                        continue
-
-                    pair_emb = cand_embs[pair_idx] if pair_idx < len(cand_embs) else ModelsLoader.encode_texts([pair_text])[0]
-
-                    # Intra-Criterion Cross-Proposition Affinity Guard
-                    if sibling_prop_embs is not None and len(sibling_prop_embs) > 0:
-                        other_prop_sims = cosine_similarity([pair_emb], sibling_prop_embs)[0]
-                        if len(other_prop_sims) > 0 and float(other_prop_sims.max()) > pair_sim + 0.10:
-                            continue
-
-                    # Cross-criterion isolation
-                    if prop_other_embs is not None and len(prop_other_embs) > 0:
-                        other_sims = cosine_similarity([pair_emb], prop_other_embs)[0]
-                        if len(other_sims) > 0 and float(other_sims.max()) >= pair_sim:
-                            continue
-
-                    contra_candidates.append((pair_idx, pair_text))
 
             seen_cands = set()
             unique_contra_candidates = []
@@ -946,6 +950,9 @@ class GradingEngine:
                     rev_results = ModelsLoader.predict_nli(rev_pairs)
                     for r_idx, r in zip(rev_indices, rev_results):
                         if r["entailment"] >= 0.70 and r["contradiction"] < 0.30:
+                            cand_fwd = cand_prop_nli.get(r_idx)
+                            if cand_fwd and (cand_fwd["contradiction"] >= 0.15 and cand_fwd["contradiction"] > cand_fwd["entailment"]):
+                                continue
                             rev_ent = r["entailment"] * 0.90
                             if rev_ent > ent_score:
                                 ent_score = rev_ent
@@ -972,15 +979,21 @@ class GradingEngine:
                 if verify_cand:
                     rev_check = ModelsLoader.predict_nli([(prop, verify_cand)])[0]
                     if rev_check["contradiction"] >= 0.60 and rev_check["contradiction"] > rev_check["entailment"]:
-                        # Reverse NLI Elaboration Guard:
-                        # If forward NLI is already strongly entailed (best_fwd_ent >= 0.72)
+                        # Reverse NLI Elaboration Guard (Rule 2C):
+                        # If forward NLI is already strongly entailed (best_fwd_ent >= 0.62)
                         # and candidate does not contain explicit polarity-inverting qualifiers,
                         # treat as a valid detailed elaboration (do NOT override with contradiction).
                         has_polarity_inversion = bool(re.search(
-                            r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|after|before|ignore|reject|pull[\s-]+power|unplug)\b',
+                            r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|ignore|reject|pull[\s-]+power|unplug)\b',
                             verify_cand
                         ))
-                        if best_fwd_ent >= 0.72 and not has_polarity_inversion:
+                        cand_fwd_r = cand_prop_nli.get(best_ent_cand_idx) if best_ent_cand_idx is not None else None
+                        if cand_fwd_r is None:
+                            cand_fwd_r = ModelsLoader.predict_nli([(verify_cand, prop)])[0]
+                        cand_fwd_ent = cand_fwd_r["entailment"]
+                        cand_fwd_contra = cand_fwd_r["contradiction"]
+
+                        if (best_fwd_ent >= 0.62 or cand_fwd_ent >= 0.62 or ent_score >= 0.62) and cand_fwd_contra < 0.25 and not has_polarity_inversion:
                             is_prop_demonstrated = True
                         else:
                             is_contradiction = True
@@ -1001,25 +1014,64 @@ class GradingEngine:
                     c_contra = r["contradiction"]
                     c_ent = r["entailment"]
 
-                    # Intra-Criterion Cross-Proposition Affinity Guard
+                    # Rule 2A: Never evaluate contradiction if candidate is not conceptually grounded in proposition
                     c_sim = float(sims[c_idx]) if c_idx < len(sims) else None
+                    if not cls._is_conceptually_related(c_text, prop, c_sim, distinctive_prop_tokens, prop_tokens):
+                        continue
+
+                    # Intra-Criterion Cross-Proposition Affinity Guard (Rule 2B)
+                    c_tokens = cls._extract_content_tokens(c_text)
+                    c_has_overlap = bool(c_tokens & (prop_tokens | distinctive_prop_tokens))
                     if sibling_prop_embs is not None and len(sibling_prop_embs) > 0:
                         c_emb = cand_embs[c_idx] if c_idx < len(cand_embs) else ModelsLoader.encode_texts([c_text])[0]
                         if c_sim is None:
                             c_sim = float(cosine_similarity([c_emb], [prop_emb])[0][0])
                         other_prop_sims = cosine_similarity([c_emb], sibling_prop_embs)[0]
-                        if len(other_prop_sims) > 0 and float(other_prop_sims.max()) > c_sim + 0.10:
+                        if len(other_prop_sims) > 0 and not c_has_overlap and float(other_prop_sims.max()) > c_sim + 0.12:
+                            continue
+
+                    is_explicit_neg = bool(re.search(neg_regex, c_text))
+
+                    # Cross-Criterion Conceptual Isolation Guard:
+                    # If candidate has no explicit negation and shares distinctive vocabulary belonging
+                    # exclusively to another rubric criterion (absent from this criterion),
+                    # it expresses that other criterion's concept, not a contradiction of this proposition!
+                    if not is_explicit_neg and all_criteria_descriptions:
+                        has_other_crit_exclusive = False
+                        current_crit_toks = cls._extract_content_tokens(criterion_description)
+                        for other_cname, other_cdesc in all_criteria_descriptions.items():
+                            if other_cname != criterion_name and other_cdesc and other_cdesc.strip():
+                                other_crit_toks = cls._extract_content_tokens(other_cdesc)
+                                exclusive_toks = other_crit_toks - current_crit_toks
+                                if len(c_tokens & exclusive_toks) >= 1:
+                                    dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
+                                    overlap = c_tokens & dist_prop_toks
+                                    base_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in overlap}
+                                    if len(base_overlap) < 2:
+                                        has_other_crit_exclusive = True
+                                        break
+                        if has_other_crit_exclusive:
                             continue
 
                     # If candidate demonstrates or entails a sibling proposition within the same criterion,
                     # it expresses that sibling rubric concept, not a contradiction of this proposition!
-                    if sibling_props:
+                    if sibling_props and not is_explicit_neg:
                         is_sibling_entailed = False
                         for sp in sibling_props:
+                            sp_toks = cls._extract_content_tokens(sp)
+                            # Sibling proposition must share content tokens with candidate
+                            if not (c_tokens & sp_toks):
+                                continue
                             sp_r = ModelsLoader._nli_cache.get((c_text, sp))
                             if sp_r is None:
                                 sp_r = ModelsLoader.predict_nli([(c_text, sp)])[0]
-                            if sp_r["entailment"] >= 0.40 and sp_r["entailment"] > sp_r["contradiction"]:
+                            if sp_r["entailment"] >= 0.50 and sp_r["entailment"] > sp_r["contradiction"]:
+                                is_sibling_entailed = True
+                                break
+                            rev_sp = ModelsLoader._nli_cache.get((sp, c_text))
+                            if rev_sp is None:
+                                rev_sp = ModelsLoader.predict_nli([(sp, c_text)])[0]
+                            if rev_sp["entailment"] >= 0.50 and rev_sp["contradiction"] < 0.25:
                                 is_sibling_entailed = True
                                 break
                         if is_sibling_entailed:
@@ -1028,8 +1080,6 @@ class GradingEngine:
                     # If candidate has moderate forward entailment to prop, it expresses the concept, not contradicts it!
                     if c_ent >= 0.35:
                         continue
-
-                    is_explicit_neg = bool(re.search(neg_regex, c_text))
 
                     # For enumerations/proportional criteria or list of examples:
                     # An affirmative sentence providing examples or applications must NEVER be treated as a contradiction!
@@ -1055,17 +1105,14 @@ class GradingEngine:
                         # Affirmative misconception check even when is_prop_demonstrated is True:
                         rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
                         if (
-                            c_contra >= 0.15
-                            and c_contra > c_ent
-                            and rev_nli["contradiction"] >= 0.85
-                            and rev_nli["contradiction"] > rev_nli["entailment"]
-                            and rev_nli["entailment"] < 0.15
+                            (c_contra >= 0.03 and c_contra > c_ent and rev_nli["contradiction"] >= 0.85 and rev_nli["contradiction"] > rev_nli["entailment"] and rev_nli["entailment"] < 0.15)
+                            or (c_contra >= 0.48 and c_contra > c_ent and rev_nli["contradiction"] >= 0.45)
                         ):
                             has_polarity_inversion = bool(re.search(
-                                r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|after|before|ignore|reject|pull[\s-]+power|unplug)\b',
+                                r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|same\s+key|ignore|reject|pull[\s-]+power|unplug)\b',
                                 c_text
                             ))
-                            if has_polarity_inversion and not (c_ent >= 0.72):
+                            if (has_polarity_inversion or rev_nli["contradiction"] >= 0.85) and not (c_ent >= 0.72):
                                 is_contradiction = True
                                 cand = c_text
                                 contradictions_found.append(
@@ -1076,26 +1123,31 @@ class GradingEngine:
 
                     # Otherwise, proposition was not strongly demonstrated:
                     if is_explicit_neg:
-                        if c_contra >= 0.55 and c_contra > c_ent:
-                            rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
-                            if rev_nli["contradiction"] >= 0.35:
-                                is_contradiction = True
-                                cand = c_text
-                                contradictions_found.append(
-                                    f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
-                                )
-                                break
+                        rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
+                        if (c_contra >= 0.48 and c_contra > c_ent and rev_nli["contradiction"] >= 0.35) or (
+                            c_contra >= 0.03
+                            and c_contra > c_ent
+                            and rev_nli["contradiction"] >= 0.85
+                            and rev_nli["contradiction"] > rev_nli["entailment"]
+                            and rev_nli["entailment"] < 0.15
+                        ):
+                            is_contradiction = True
+                            cand = c_text
+                            contradictions_found.append(
+                                f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
+                            )
+                            break
                     else:
                         # Affirmative misconception:
                         # Verified by Reverse NLI so partial elaborations (e.g. Student A on MBL with rev_nli < 0.30)
                         # are not falsely penalized as contradictions
                         rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
                         has_polarity_inversion = bool(re.search(
-                            r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|after|before|ignore|reject|pull[\s-]+power|unplug)\b',
+                            r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|ignore|reject|pull[\s-]+power|unplug)\b',
                             c_text
                         ))
                         is_rev_contra = (
-                            c_contra >= 0.15
+                            c_contra >= 0.10
                             and c_contra > c_ent
                             and rev_nli["contradiction"] >= 0.85
                             and rev_nli["contradiction"] > rev_nli["entailment"]
@@ -1109,6 +1161,10 @@ class GradingEngine:
                         )
 
                         if is_rev_contra or is_fwd_contra:
+                            # Rule 2C: If forward NLI is strongly entailed without polarity inversion,
+                            # do not flag as contradiction
+                            if c_ent >= 0.62 and not has_polarity_inversion and c_contra < 0.25:
+                                continue
                             if c_ent >= 0.72 and not has_polarity_inversion:
                                 continue
                             is_contradiction = True
@@ -1117,6 +1173,7 @@ class GradingEngine:
                                 f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
                             )
                             break
+
 
             # 4. Citation evidence verification: check lexical and semantic support from retrieved textbook citations
             has_citation_verification = False
@@ -1489,15 +1546,18 @@ class GradingEngine:
                 seen_snippets.add(key)
                 unique_citations.append(c)
 
+        total_score = round(min(assessment.total_marks, max(0.0, total_awarded)), 2)
+        has_contra = any(len(c.contradictions_detected) > 0 for c in criterion_breakdowns)
         # Flag for teacher review if citations are insufficient or contradictions occurred
         requires_teacher_review = False
-        if not unique_citations and len(student_text.strip()) > 20:
+        if not unique_citations and len(student_text.strip()) > 20 and total_score > 0.0:
             requires_teacher_review = True
             review_reasons.append("No supporting institutional evidence was retrieved from the knowledge base.")
-        if any(len(c.contradictions_detected) > 0 for c in criterion_breakdowns):
+        if has_contra:
             requires_teacher_review = True
-
-        total_score = round(min(assessment.total_marks, max(0.0, total_awarded)), 2)
+        if total_score == 0.0 and not has_contra:
+            requires_teacher_review = False
+            review_reasons = []
         percentage = round((total_score / assessment.total_marks) * 100, 1) if assessment.total_marks > 0 else 0.0
 
         if effective_feedback_mode == "none":
@@ -1779,7 +1839,11 @@ class GradingEngine:
                 seen_snippets.add(key)
                 unique_citations.append(c)
 
-        requires_teacher_review = any(qr.requires_teacher_review for qr in question_grading_results)
+        has_multi_contra = any(any(len(c.contradictions_detected) > 0 for c in qr.criterion_breakdown) for qr in question_grading_results)
+        if total_score == 0.0 and not has_multi_contra:
+            requires_teacher_review = False
+        else:
+            requires_teacher_review = any(qr.requires_teacher_review for qr in question_grading_results)
 
         if effective_feedback_mode == "none":
             overall_feedback = ""

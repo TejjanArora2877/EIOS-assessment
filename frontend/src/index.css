@@ -545,33 +545,35 @@ body {
   align-items: center;
   justify-content: center;
   z-index: 100;
-  padding: 1.5rem;
+  padding: 0.75rem;
 }
 
 .batch-breakdown-modal-dialog {
   background-color: #ffffff;
   border-radius: var(--radius);
-  width: 75vw;
-  max-width: 1400px;
-  max-height: 90vh;
+  width: 100%;
+  max-width: none !important;
+  max-height: 95vh;
   overflow-y: auto;
   padding: 1.5rem;
   box-shadow: var(--shadow-md);
-  margin: 0 auto;
+  margin: 0;
 }
 
 @media (max-width: 1024px) {
   .batch-breakdown-modal-dialog {
-    width: 90vw;
+    width: 100%;
+    max-width: none !important;
   }
 }
 
 @media (max-width: 768px) {
   .batch-breakdown-modal-backdrop {
-    padding: 1rem 0.75rem;
+    padding: 0.5rem;
   }
   .batch-breakdown-modal-dialog {
-    width: 95vw;
+    width: 100%;
+    max-width: none !important;
     padding: 1.25rem 1rem;
   }
 }
