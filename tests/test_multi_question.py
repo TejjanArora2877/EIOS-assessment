@@ -408,3 +408,56 @@ def test_detailed_elaboration_not_penalized_by_reverse_nli():
     assert len(bad_data["criterion_breakdown"][0]["contradictions_detected"]) > 0
     assert bad_data["requires_teacher_review"] is True
 
+
+def test_paraphrase_guards_and_off_topic_review_suppression():
+    """
+    Tests:
+    1. Guard A: Conditional/contrapositive paraphrase using 'without' does not trip Reverse NLI contradiction.
+    2. Guard B: Multi-clause contrastive proposition with 'whereas' allows one-sided answers without contradiction.
+    3. Guard C: Completely off-topic submission scores 0.00 and suppresses requires_teacher_review.
+    """
+    payload = {
+        "title": "Digital Forensics Principles",
+        "question": "Explain volatile acquisition and live response platforms.",
+        "model_answer": "Live response on Windows systems uses winpmem, whereas Unix systems use LiME.",
+        "total_marks": 5.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "Live Collection Contrast",
+                "description": "Live response on Windows systems uses tools such as winpmem, whereas Unix systems inspect /proc and use LiME.",
+                "max_marks": 5.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    # 1. Guard A & B: Student answers only one contrastive clause using conditional framing
+    student_contrapositive = "Without live kernel memory acquisition tools like LiME, Unix system /proc structures cannot be captured."
+    res_cp = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_contrapositive,
+        "feedback_mode": "none"
+    })
+    assert res_cp.status_code == 200
+    cp_data = res_cp.json()
+    assert len(cp_data["criterion_breakdown"][0]["contradictions_detected"]) == 0
+    assert cp_data["requires_teacher_review"] is False
+
+    # 2. Guard C: Completely off-topic submission must score 0.00 and have requires_teacher_review == False
+    off_topic_text = "Photosynthesis takes place in the chloroplasts of plant cells using sunlight and carbon dioxide to generate glucose."
+    res_off = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": off_topic_text,
+        "feedback_mode": "none"
+    })
+    assert res_off.status_code == 200
+    off_data = res_off.json()
+    assert off_data["total_score"] == 0.00
+    assert off_data["requires_teacher_review"] is False
+    assert len(off_data["review_reasons"]) == 0
+
+

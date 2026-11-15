@@ -20,6 +20,7 @@ from backend.app.models import (
     UCEScores
 )
 from backend.app.services.models_loader import ModelsLoader
+from backend.app.services.vector_store import VectorStore
 from backend.app.services.retriever import HybridRetriever
 from backend.app.services.llm_feedback import LLMFeedbackService
 from backend.app.services.answer_segmenter import AnswerSegmenter
@@ -756,8 +757,12 @@ class GradingEngine:
                     unique_contra_candidates.append((c_idx, c_text))
             unique_contra_candidates = unique_contra_candidates[:10]
 
+            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
             for _, c_text in unique_contra_candidates:
                 fwd_pairs_to_batch.append((c_text, prop))
+                if len(contrast_clauses) >= 2:
+                    for cl in contrast_clauses:
+                        fwd_pairs_to_batch.append((c_text, cl))
 
             prop_precomputed.append({
                 "prop": prop,
@@ -979,6 +984,31 @@ class GradingEngine:
                 if verify_cand:
                     rev_check = ModelsLoader.predict_nli([(prop, verify_cand)])[0]
                     if rev_check["contradiction"] >= 0.60 and rev_check["contradiction"] > rev_check["entailment"]:
+                        cand_fwd_r = cand_prop_nli.get(best_ent_cand_idx) if best_ent_cand_idx is not None else None
+                        if cand_fwd_r is None:
+                            cand_fwd_r = ModelsLoader.predict_nli([(verify_cand, prop)])[0]
+                        cand_fwd_ent = cand_fwd_r["entailment"]
+                        cand_fwd_contra = cand_fwd_r["contradiction"]
+
+                        # Guard A: Conditional / Contrapositive Framing Guard
+                        has_conditional = bool(re.search(r'(?i)\b(without|unless|absent|if\s+not)\b', verify_cand))
+                        dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
+                        v_tokens = cls._extract_content_tokens(verify_cand)
+                        base_dist_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in (v_tokens & dist_prop_toks)}
+                        is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and cand_fwd_contra < 0.35
+
+                        # Guard B: Multi-Clause Contrastive Proposition Guard
+                        contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+                        is_contrast_subclause_entailed = False
+                        if len(contrast_clauses) >= 2:
+                            for cl in contrast_clauses:
+                                cl_r = ModelsLoader._nli_cache.get((verify_cand, cl))
+                                if cl_r is None:
+                                    cl_r = ModelsLoader.predict_nli([(verify_cand, cl)])[0]
+                                if cl_r["entailment"] >= 0.60 and cl_r["entailment"] > cl_r["contradiction"]:
+                                    is_contrast_subclause_entailed = True
+                                    break
+
                         # Reverse NLI Elaboration Guard (Rule 2C):
                         # If forward NLI is already strongly entailed (best_fwd_ent >= 0.62)
                         # and candidate does not contain explicit polarity-inverting qualifiers,
@@ -987,13 +1017,10 @@ class GradingEngine:
                             r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|ignore|reject|pull[\s-]+power|unplug)\b',
                             verify_cand
                         ))
-                        cand_fwd_r = cand_prop_nli.get(best_ent_cand_idx) if best_ent_cand_idx is not None else None
-                        if cand_fwd_r is None:
-                            cand_fwd_r = ModelsLoader.predict_nli([(verify_cand, prop)])[0]
-                        cand_fwd_ent = cand_fwd_r["entailment"]
-                        cand_fwd_contra = cand_fwd_r["contradiction"]
+                        if is_contrapositive:
+                            has_polarity_inversion = False
 
-                        if (best_fwd_ent >= 0.62 or cand_fwd_ent >= 0.62 or ent_score >= 0.62) and cand_fwd_contra < 0.25 and not has_polarity_inversion:
+                        if is_contrapositive or is_contrast_subclause_entailed or ((best_fwd_ent >= 0.62 or cand_fwd_ent >= 0.62 or ent_score >= 0.62) and cand_fwd_contra < 0.25 and not has_polarity_inversion):
                             is_prop_demonstrated = True
                         else:
                             is_contradiction = True
@@ -1108,6 +1135,27 @@ class GradingEngine:
                             (c_contra >= 0.03 and c_contra > c_ent and rev_nli["contradiction"] >= 0.85 and rev_nli["contradiction"] > rev_nli["entailment"] and rev_nli["entailment"] < 0.15)
                             or (c_contra >= 0.48 and c_contra > c_ent and rev_nli["contradiction"] >= 0.45)
                         ):
+                            # Guard A: Conditional / Contrapositive Framing Guard
+                            has_conditional = bool(re.search(r'(?i)\b(without|unless|absent|if\s+not)\b', c_text))
+                            dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
+                            base_dist_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in (c_tokens & dist_prop_toks)}
+                            is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and c_contra < 0.35
+
+                            # Guard B: Multi-Clause Contrastive Proposition Guard
+                            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+                            is_contrast_subclause_entailed = False
+                            if len(contrast_clauses) >= 2:
+                                for cl in contrast_clauses:
+                                    cl_r = ModelsLoader._nli_cache.get((c_text, cl))
+                                    if cl_r is None:
+                                        cl_r = ModelsLoader.predict_nli([(c_text, cl)])[0]
+                                    if cl_r["entailment"] >= 0.60 and cl_r["entailment"] > cl_r["contradiction"]:
+                                        is_contrast_subclause_entailed = True
+                                        break
+
+                            if is_contrapositive or is_contrast_subclause_entailed:
+                                continue
+
                             has_polarity_inversion = bool(re.search(
                                 r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|same\s+key|ignore|reject|pull[\s-]+power|unplug)\b',
                                 c_text
@@ -1122,6 +1170,26 @@ class GradingEngine:
                         continue
 
                     # Otherwise, proposition was not strongly demonstrated:
+                    # Guard A: Conditional / Contrapositive Framing Guard
+                    has_conditional = bool(re.search(r'(?i)\b(without|unless|absent|if\s+not)\b', c_text))
+                    dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
+                    base_dist_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in (c_tokens & dist_prop_toks)}
+                    is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and c_contra < 0.35
+
+                    # Guard B: Multi-Clause Contrastive Proposition Guard
+                    contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+                    is_contrast_subclause_entailed = False
+                    if len(contrast_clauses) >= 2:
+                        for cl in contrast_clauses:
+                            cl_r = ModelsLoader._nli_cache.get((c_text, cl))
+                            if cl_r is None:
+                                cl_r = ModelsLoader.predict_nli([(c_text, cl)])[0]
+                            if cl_r["entailment"] >= 0.60 and cl_r["entailment"] > cl_r["contradiction"]:
+                                is_contrast_subclause_entailed = True
+                                break
+
+                    if is_contrapositive or is_contrast_subclause_entailed:
+                        continue
                     if is_explicit_neg:
                         rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
                         if (c_contra >= 0.48 and c_contra > c_ent and rev_nli["contradiction"] >= 0.35) or (
@@ -1548,14 +1616,25 @@ class GradingEngine:
 
         total_score = round(min(assessment.total_marks, max(0.0, total_awarded)), 2)
         has_contra = any(len(c.contradictions_detected) > 0 for c in criterion_breakdowns)
+        all_present_empty = all(len(c.present_concepts) == 0 for c in criterion_breakdowns)
+        max_cand_sim = float(cosine_similarity(ModelsLoader.encode_texts(all_assessment_props), cand_embs).max()) if (cand_embs is not None and len(cand_embs) > 0 and all_assessment_props) else 0.0
+
         # Flag for teacher review if citations are insufficient or contradictions occurred
         requires_teacher_review = False
-        if not unique_citations and len(student_text.strip()) > 20 and total_score > 0.0:
+        has_kb_docs = False
+        try:
+            has_kb_docs = VectorStore.get_collection().count() > 0
+        except Exception:
+            has_kb_docs = False
+
+        if has_kb_docs and not unique_citations and len(student_text.strip()) > 20 and total_score > 0.0:
             requires_teacher_review = True
             review_reasons.append("No supporting institutional evidence was retrieved from the knowledge base.")
         if has_contra:
             requires_teacher_review = True
-        if total_score == 0.0 and not has_contra:
+
+        # Guard C: Zero-Grounding Off-Topic Submission Guard
+        if total_score == 0.0 and (not has_contra or (all_present_empty and max_cand_sim < 0.45)):
             requires_teacher_review = False
             review_reasons = []
         percentage = round((total_score / assessment.total_marks) * 100, 1) if assessment.total_marks > 0 else 0.0
@@ -1840,8 +1919,13 @@ class GradingEngine:
                 unique_citations.append(c)
 
         has_multi_contra = any(any(len(c.contradictions_detected) > 0 for c in qr.criterion_breakdown) for qr in question_grading_results)
-        if total_score == 0.0 and not has_multi_contra:
+        all_multi_present_empty = all(len(c.present_concepts) == 0 for c in all_criteria)
+        has_positive_answer = any(qr.student_answer_slice.strip() and qr.awarded_marks > 0 for qr in question_grading_results)
+
+        # Guard C: Zero-Grounding Off-Topic Multi-Question Guard
+        if total_score == 0.0 and (not has_multi_contra or (all_multi_present_empty and not has_positive_answer)):
             requires_teacher_review = False
+            all_review_reasons = []
         else:
             requires_teacher_review = any(qr.requires_teacher_review for qr in question_grading_results)
 
