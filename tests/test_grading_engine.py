@@ -620,7 +620,7 @@ def test_regression_affirmative_misconception_detected(monkeypatch, dummy_citati
     def mock_predict_nli(pairs):
         results = []
         for prem, hyp in pairs:
-            if "completely prevents" in prem:
+            if "completely prevents" in prem or "completely prevents" in hyp:
                 results.append({"entailment": 0.02, "contradiction": 0.95, "neutral": 0.03})
             else:
                 results.append({"entailment": 0.10, "contradiction": 0.05, "neutral": 0.85})
@@ -724,7 +724,7 @@ def test_regression_long_answer_mixed_valid_and_contradictory_sentences(monkeypa
             if "protects data payload" in prem and "confidentiality" in hyp:
                 results.append({"entailment": 0.92, "contradiction": 0.01, "neutral": 0.07})
             # Misconception contradicts traffic analysis limitation
-            elif "completely prevents" in prem and "cannot prevent traffic" in hyp:
+            elif ("completely prevents" in prem and "cannot prevent traffic" in hyp) or ("cannot prevent traffic" in prem and "completely prevents" in hyp):
                 results.append({"entailment": 0.02, "contradiction": 0.95, "neutral": 0.03})
             else:
                 results.append({"entailment": 0.05, "contradiction": 0.05, "neutral": 0.90})
@@ -1410,3 +1410,49 @@ def test_regression_security_student_a_and_b_retain_high_marks(monkeypatch, dumm
     assert res_b.total_score >= 18.0, f"Expected Student B >= 18.00, got {res_b.total_score}"
     assert res_b.requires_teacher_review is False
     assert all(len(cb.contradictions_detected) == 0 for cb in res_b.criterion_breakdown)
+
+
+def test_predict_nli_batch_matches_single_calls():
+    """
+    Verifies that ModelsLoader.predict_nli_batch produces identical probability scores
+    to individual ModelsLoader.predict_nli calls and populates ModelsLoader._nli_cache.
+    """
+    ModelsLoader.clear_caches()
+    pairs = [
+        ("Memory-Based Learning is a classification approach.", "MBL is used for classification."),
+        ("Cybersecurity protects network systems and data.", "Relational databases use SQL joins."),
+        ("Passive attacks observe transmission without altering data.", "Active attacks modify system resources."),
+        ("The sky is blue today.", "The weather is sunny."),
+    ]
+
+    # 1. Test individual predict_nli calls
+    single_results = []
+    for p, h in pairs:
+        res = ModelsLoader.predict_nli(p, h)
+        single_results.append(res)
+
+    # Verify _nli_cache is populated
+    for p, h in pairs:
+        assert (p, h) in ModelsLoader._nli_cache
+
+    # 2. Clear cache and run predict_nli_batch
+    ModelsLoader.clear_caches()
+    assert len(ModelsLoader._nli_cache) == 0
+
+    batch_results = ModelsLoader.predict_nli_batch(pairs, batch_size=2)
+
+    # Verify results are identical and cache is populated
+    assert len(batch_results) == len(single_results)
+    for p, h in pairs:
+        assert (p, h) in ModelsLoader._nli_cache
+
+    for single_r, batch_r in zip(single_results, batch_results):
+        for label in ("entailment", "contradiction", "neutral"):
+            assert pytest.approx(single_r[label], abs=1e-5) == batch_r[label]
+
+    # 3. Verify predict_nli with list of pairs also produces identical results
+    list_results = ModelsLoader.predict_nli(pairs)
+    assert len(list_results) == len(batch_results)
+    for list_r, batch_r in zip(list_results, batch_results):
+        for label in ("entailment", "contradiction", "neutral"):
+            assert list_r[label] == batch_r[label]

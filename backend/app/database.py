@@ -1,3 +1,4 @@
+import uuid
 import sqlite3
 from typing import Generator
 from contextlib import contextmanager
@@ -80,14 +81,56 @@ def init_db():
             CREATE TABLE IF NOT EXISTS rubric_criteria (
                 id TEXT PRIMARY KEY,
                 assessment_id TEXT NOT NULL,
+                question_id TEXT,
                 order_index INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 description TEXT NOT NULL,
                 max_marks REAL NOT NULL,
-                FOREIGN KEY (assessment_id) REFERENCES assessments (id) ON DELETE CASCADE
+                FOREIGN KEY (assessment_id) REFERENCES assessments (id) ON DELETE CASCADE,
+                FOREIGN KEY (question_id) REFERENCES assessment_questions (id) ON DELETE CASCADE
             );
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rubric_assessment ON rubric_criteria(assessment_id);")
+
+        # Assessment questions table (for multi-question assessments)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS assessment_questions (
+                id TEXT PRIMARY KEY,
+                assessment_id TEXT NOT NULL,
+                question_order INTEGER NOT NULL,
+                question_text TEXT NOT NULL,
+                model_answer TEXT,
+                max_marks REAL NOT NULL,
+                FOREIGN KEY (assessment_id) REFERENCES assessments (id) ON DELETE CASCADE
+            );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_questions_assessment ON assessment_questions(assessment_id);")
+
+        # Ensure question_id column exists on rubric_criteria if table was already created
+        cursor.execute("PRAGMA table_info(rubric_criteria);")
+        crit_cols = [row["name"] for row in cursor.fetchall()]
+        if "question_id" not in crit_cols:
+            cursor.execute("ALTER TABLE rubric_criteria ADD COLUMN question_id TEXT REFERENCES assessment_questions(id) ON DELETE CASCADE;")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rubric_question ON rubric_criteria(question_id);")
+
+        # Auto-migration on startup: For any existing single-question Assessment in SQLite
+        # that has no rows in assessment_questions, automatically create a default Question 1 record
+        # from assessment.question and assessment.model_answer, and link its existing RubricCriterion rows to it.
+        cursor.execute("SELECT id, question, model_answer, total_marks FROM assessments;")
+        all_assessments = cursor.fetchall()
+        for a in all_assessments:
+            aid = a["id"]
+            cursor.execute("SELECT COUNT(*) as cnt FROM assessment_questions WHERE assessment_id = ?", (aid,))
+            if cursor.fetchone()["cnt"] == 0:
+                qid = str(uuid.uuid4())
+                q_text = a["question"] or ""
+                q_ans = a["model_answer"] or ""
+                q_marks = float(a["total_marks"] or 0.0)
+                cursor.execute("""
+                    INSERT INTO assessment_questions (id, assessment_id, question_order, question_text, model_answer, max_marks)
+                    VALUES (?, ?, 1, ?, ?, ?)
+                """, (qid, aid, q_text, q_ans, q_marks))
+                cursor.execute("UPDATE rubric_criteria SET question_id = ? WHERE assessment_id = ? AND question_id IS NULL", (qid, aid))
 
         # Audit and provenance records for grading
         cursor.execute("""

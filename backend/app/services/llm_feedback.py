@@ -314,6 +314,10 @@ class LLMFeedbackService:
             filtered_missing = []
             for m in clean_missing:
                 m_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', m).strip(' ,;-')
+                m_clean = m_clean.rstrip('.')
+                m_clean = re.sub(r'[;,]\s*([;,])', r'\1', m_clean)
+                m_clean = re.sub(r'\.\s*;', ';', m_clean)
+                m_clean = re.sub(r'\.{2,}', '.', m_clean)
                 if m_clean and m_clean not in filtered_missing:
                     filtered_missing.append(m_clean)
             if filtered_missing:
@@ -325,12 +329,20 @@ class LLMFeedbackService:
             filtered_present = []
             for p in (clean_present or []):
                 p_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', p).strip(' ,;-')
+                p_clean = p_clean.rstrip('.')
+                p_clean = re.sub(r'[;,]\s*([;,])', r'\1', p_clean)
+                p_clean = re.sub(r'\.\s*;', ';', p_clean)
+                p_clean = re.sub(r'\.{2,}', '.', p_clean)
                 if p_clean and p_clean not in filtered_present:
                     filtered_present.append(p_clean)
 
             filtered_missing = []
             for m in clean_missing:
                 m_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', m).strip(' ,;-')
+                m_clean = m_clean.rstrip('.')
+                m_clean = re.sub(r'[;,]\s*([;,])', r'\1', m_clean)
+                m_clean = re.sub(r'\.\s*;', ';', m_clean)
+                m_clean = re.sub(r'\.{2,}', '.', m_clean)
                 if m_clean and m_clean not in filtered_missing:
                     filtered_missing.append(m_clean)
 
@@ -383,6 +395,7 @@ class LLMFeedbackService:
         Formats missing enumeration items with a context-appropriate label.
         Uses 'Additional applications:' if the criterion name or description contains 'application',
         otherwise uses 'Missing elements:' or 'Expected concepts:'.
+        Cleans consecutive punctuation artifacts and joins cleanly with '; '.
         """
         if not missing_items:
             return ""
@@ -391,7 +404,25 @@ class LLMFeedbackService:
             label = "Additional applications:"
         else:
             label = default_label
-        return f"{label} {', '.join(missing_items)}"
+
+        clean_items = []
+        for it in missing_items:
+            c_it = re.sub(r'[;,]\s*([;,])', r'\1', it.strip())
+            c_it = re.sub(r'\.\s*;', ';', c_it)
+            c_it = re.sub(r'\.{2,}', '.', c_it)
+            c_it = c_it.strip(' ;,').rstrip('.')
+            if c_it and c_it not in clean_items:
+                clean_items.append(c_it)
+
+        if not clean_items:
+            return ""
+
+        joined = "; ".join(clean_items)
+        joined = re.sub(r'[;,]\s*([;,])', r'\1', joined)
+        joined = re.sub(r'\.\s*;', ';', joined)
+        joined = re.sub(r'\.{2,}', '.', joined)
+        joined = joined.rstrip(' ;,').rstrip('.')
+        return f"{label} {joined}"
 
     @classmethod
     def generate_criterion_feedback(
@@ -482,15 +513,23 @@ class LLMFeedbackService:
                 clean_m = []
                 for m in clean_missing:
                     m_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', m).strip(' ,;-')
+                    m_clean = m_clean.rstrip('.')
+                    m_clean = re.sub(r'[;,]\s*([;,])', r'\1', m_clean)
+                    m_clean = re.sub(r'\.\s*;', ';', m_clean)
+                    m_clean = re.sub(r'\.{2,}', '.', m_clean)
                     if m_clean and m_clean not in clean_m:
                         clean_m.append(m_clean)
                 if not clean_m and target_propositions:
                     for tp in target_propositions:
                         tp_clean = re.sub(r'(?i)\b(?:such as|for example|e\.g\.).*', '', tp).strip(' ,;-')
+                        tp_clean = tp_clean.rstrip('.')
+                        tp_clean = re.sub(r'[;,]\s*([;,])', r'\1', tp_clean)
+                        tp_clean = re.sub(r'\.\s*;', ';', tp_clean)
+                        tp_clean = re.sub(r'\.{2,}', '.', tp_clean)
                         if tp_clean and tp_clean not in clean_m:
                             clean_m.append(tp_clean)
                 if not clean_m:
-                    clean_m = [criterion_description]
+                    clean_m = [criterion_description.rstrip('.')]
                 missing_concepts_str = "; ".join(clean_m[:2])
                 zero_fb = f"The response does not address '{criterion_name}'. Expected concepts to address: {missing_concepts_str}."
             if feedback_stats is not None:
@@ -721,10 +760,12 @@ Provide 2-3 concise, constructive feedback sentences for the student adhering to
                     "model": settings.OLLAMA_MODEL,
                     "prompt": base_prompt,
                     "stream": False,
+                    "keep_alive": "15m",
                     "options": {
+                        "num_ctx": 1024,
+                        "num_predict": 80,
                         "temperature": 0.2,
-                        "top_p": 0.9,
-                        "num_predict": 120
+                        "top_p": 0.9
                     }
                 }
             )
@@ -813,11 +854,24 @@ Provide 2-3 concise, constructive feedback sentences for the student adhering to
         total_score: float,
         max_score: float,
         review_reasons: List[str],
-        feedback_mode: Optional[str] = None
+        feedback_mode: Optional[str] = None,
+        criterion_breakdowns: Optional[List[Any]] = None,
+        student_text: Optional[str] = None
     ) -> str:
-        """Generates a concise overall summary of student performance."""
+        """
+        Generates a concise overall summary of student performance.
+        For scores >= 95% without teacher review flags, returns an immediate deterministic commendation.
+        For partial/contradictory submissions, constructs a prompt purely from structured criterion results
+        (bullet points of strengths vs missing/contradictory items) rather than raw student text,
+        using bounded generation (num_predict=90, temperature=0.2) or deterministic fallback.
+        """
         if feedback_mode and feedback_mode.lower() == "none":
             return ""
+
+        # Instant deterministic commendation template for >= 95% scores
+        if total_score >= max_score * 0.95 - 1e-4 and not review_reasons:
+            return "Comprehensive and accurate response. All core concepts across all criteria were thoroughly demonstrated."
+
         percentage = (total_score / max_score * 100) if max_score > 0 else 0
         if total_score == 0.0 or percentage == 0.0:
             summary = "The submission does not address the assessed topic or meet any rubric criteria."
@@ -832,4 +886,79 @@ Provide 2-3 concise, constructive feedback sentences for the student adhering to
 
         if review_reasons:
             summary += f" Note: Teacher review recommended ({'; '.join(review_reasons)})."
+
+        effective_mode = (feedback_mode or settings.FEEDBACK_MODE).lower()
+        if effective_mode not in ("hybrid", "llm"):
+            return summary
+
+        # If hybrid mode and total_score == 0.0 without contradictions, return deterministic summary
+        if effective_mode == "hybrid" and (total_score == 0.0 or percentage == 0.0) and not review_reasons:
+            return summary
+
+        # Construct prompt purely from structured results
+        crit_lines = []
+        if criterion_breakdowns:
+            for cb in criterion_breakdowns:
+                c_name = getattr(cb, "criterion_name", "Criterion")
+                c_score = getattr(cb, "awarded_marks", 0.0)
+                c_max = getattr(cb, "max_marks", 0.0)
+                pres = getattr(cb, "present_concepts", []) or []
+                miss = getattr(cb, "missing_concepts", []) or []
+                contra = getattr(cb, "contradictions_detected", []) or []
+
+                parts = [f"- {c_name} ({c_score:.1f}/{c_max:.1f} marks):"]
+                if pres:
+                    parts.append(f"  Strengths: {', '.join(pres[:2])}")
+                if miss:
+                    parts.append(f"  Missing: {', '.join(miss[:2])}")
+                if contra:
+                    parts.append(f"  Contradictions: {len(contra)} identified")
+                crit_lines.append("\n".join(parts))
+
+        criteria_summary_str = "\n".join(crit_lines) if crit_lines else "None provided."
+
+        prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are an expert academic evaluator. Provide a direct, objective overall evaluation summary of the student's exam performance in 2 concise sentences.
+RULES:
+- Do NOT output conversational filler or preambles (e.g., 'Here is the feedback', 'Overall:').
+- Focus on overall demonstrated strengths and key areas for conceptual improvement.
+- Adhere strictly to the marks ({total_score:.1f}/{max_score:.1f}).
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+Question: {question}
+Total Score: {total_score:.1f} / {max_score:.1f} ({percentage:.1f}%)
+
+Criterion-Level Structured Findings:
+{criteria_summary_str}
+
+Provide a 2-sentence constructive overall evaluation summary:
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+"""
+        try:
+            client = cls.get_client()
+            response = client.post(
+                f"{settings.OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": settings.OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "keep_alive": "15m",
+                    "options": {
+                        "num_ctx": 1024,
+                        "num_predict": 80,
+                        "temperature": 0.2,
+                        "top_p": 0.9
+                    }
+                }
+            )
+            if response.status_code == 200:
+                resp_data = response.json()
+                cand = resp_data.get("response", "").strip()
+                cand = cls._clean_feedback_text(cand)
+                if cand and len(cand) >= 20 and cand.endswith(('.', '!', '?')):
+                    if review_reasons and not any(r.lower() in cand.lower() for r in ["review", "contradict", "conflict", "misconception"]):
+                        cand += f" Note: Teacher review recommended ({'; '.join(review_reasons)})."
+                    return cand
+        except Exception as e:
+            logger.warning(f"Overall LLM feedback generation failed or timed out: {e}")
+
         return summary

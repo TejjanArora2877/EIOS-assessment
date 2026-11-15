@@ -1,7 +1,8 @@
 import time
 import logging
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any, Union
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from backend.app.config import settings
 
@@ -11,6 +12,7 @@ class ModelsLoader:
     _embedding_model: Optional[SentenceTransformer] = None
     _reranker_model: Optional[CrossEncoder] = None
     _nli_model: Optional[CrossEncoder] = None
+    _nli_tokenizer: Optional[Any] = None
 
     _embedding_cache: Dict[str, np.ndarray] = {}
     _nli_cache: Dict[Tuple[str, str], Dict[str, float]] = {}
@@ -47,9 +49,16 @@ class ModelsLoader:
             t0 = time.perf_counter()
             logger.info(f"[Model Init] Loading CrossEncoder NLI: {settings.NLI_MODEL_NAME}")
             cls._nli_model = CrossEncoder(settings.NLI_MODEL_NAME)
+            cls._nli_tokenizer = cls._nli_model.tokenizer
             load_ms = (time.perf_counter() - t0) * 1000
             logger.info(f"[Model Init] CrossEncoder NLI '{settings.NLI_MODEL_NAME}' loaded in {load_ms:.1f}ms")
         return cls._nli_model
+
+    @classmethod
+    def get_nli_tokenizer(cls):
+        if cls._nli_tokenizer is None:
+            cls.get_nli_model()
+        return cls._nli_tokenizer
 
     @classmethod
     def encode_texts(cls, texts: List[str], batch_size: int = 128) -> np.ndarray:
@@ -60,7 +69,13 @@ class ModelsLoader:
         if uncached:
             model = cls.get_embedding_model()
             unique_uncached = list(dict.fromkeys(uncached))
-            new_embs = model.encode(unique_uncached, batch_size=batch_size, show_progress_bar=False, normalize_embeddings=True)
+            with torch.inference_mode():
+                new_embs = model.encode(
+                    unique_uncached,
+                    batch_size=batch_size,
+                    show_progress_bar=False,
+                    normalize_embeddings=True
+                )
             for t, emb in zip(unique_uncached, new_embs):
                 cls._embedding_cache[t] = emb
 
@@ -82,9 +97,13 @@ class ModelsLoader:
         return [float(s) for s in scores]
 
     @classmethod
-    def predict_nli(cls, pairs: List[Tuple[str, str]]) -> List[Dict[str, float]]:
+    def predict_nli_batch(
+        cls,
+        pairs: List[Tuple[str, str]],
+        batch_size: int = 16
+    ) -> List[Dict[str, float]]:
         """
-        Evaluates NLI for (premise, hypothesis) pairs with verified softmax.
+        Vectorized batch evaluation of NLI for (premise, hypothesis) pairs with verified softmax.
         Label mapping from model config:
           0: contradiction
           1: entailment
@@ -93,18 +112,62 @@ class ModelsLoader:
         if not pairs:
             return []
 
+        # If predict_nli has been patched (e.g., monkeypatch in unit tests), delegate to it
+        if getattr(cls.predict_nli, "__func__", cls.predict_nli) is not _ORIGINAL_PREDICT_NLI_FUNC:
+            return cls.predict_nli(pairs)
+
         uncached = [p for p in pairs if p not in cls._nli_cache]
         if uncached:
-            nli = cls.get_nli_model()
             unique_uncached = list(dict.fromkeys(uncached))
-            probs = nli.predict(unique_uncached, apply_softmax=True, batch_size=32)
-            if hasattr(probs, "ndim") and probs.ndim == 1:
-                probs = [probs]
-            for p, prob in zip(unique_uncached, probs):
-                cls._nli_cache[p] = {
-                    "contradiction": float(prob[0]),
-                    "entailment": float(prob[1]),
-                    "neutral": float(prob[2])
-                }
+            nli = cls.get_nli_model()
+            tokenizer = cls.get_nli_tokenizer()
+            model = nli.model
+            device = model.device
+
+            with torch.inference_mode():
+                for i in range(0, len(unique_uncached), batch_size):
+                    chunk = unique_uncached[i:i + batch_size]
+                    premises = [p[0] for p in chunk]
+                    hypotheses = [p[1] for p in chunk]
+                    inputs = tokenizer(
+                        premises,
+                        hypotheses,
+                        padding=True,
+                        truncation=True,
+                        max_length=256,
+                        return_tensors="pt"
+                    ).to(device)
+                    logits = model(**inputs).logits
+                    probs = torch.softmax(logits, dim=-1).cpu().tolist()
+                    for p, prob in zip(chunk, probs):
+                        cls._nli_cache[p] = {
+                            "contradiction": float(prob[0]),
+                            "entailment": float(prob[1]),
+                            "neutral": float(prob[2])
+                        }
 
         return [cls._nli_cache[p] for p in pairs]
+
+    @classmethod
+    def predict_nli(
+        cls,
+        premise_or_pairs: Any,
+        hypothesis: Optional[str] = None
+    ) -> Any:
+        """
+        Evaluates NLI for (premise, hypothesis) or a list of pairs.
+        Delegates directly to predict_nli_batch.
+        If called as predict_nli(premise, hypothesis), returns Dict[str, float].
+        If called as predict_nli([(p, h), ...]), returns List[Dict[str, float]].
+        """
+        if hypothesis is not None:
+            return cls.predict_nli_batch([(str(premise_or_pairs), str(hypothesis))])[0]
+        elif isinstance(premise_or_pairs, tuple) and len(premise_or_pairs) == 2:
+            return cls.predict_nli_batch([premise_or_pairs])[0]
+        elif isinstance(premise_or_pairs, list):
+            return cls.predict_nli_batch(premise_or_pairs)
+        else:
+            raise ValueError(f"Invalid arguments to predict_nli: {premise_or_pairs}, {hypothesis}")
+
+
+_ORIGINAL_PREDICT_NLI_FUNC = ModelsLoader.predict_nli.__func__

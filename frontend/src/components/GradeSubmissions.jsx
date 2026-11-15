@@ -651,36 +651,104 @@ export default function GradeSubmissions({
               Rubric Criterion Breakdown
             </h4>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-              {selectedBatchItem.criterion_breakdown && selectedBatchItem.criterion_breakdown.map((crit, idx) => (
-                <div key={idx} style={{
-                  border: '1px solid var(--border)',
-                  borderRadius: '6px',
-                  padding: '0.85rem',
-                  backgroundColor: 'var(--bg-main)'
-                }}>
-                  <div className="flex-between" style={{ marginBottom: '0.35rem' }}>
-                    <strong style={{ fontSize: '0.9rem' }}>{crit.criterion_name}</strong>
-                    <span className="badge badge-neutral">
-                      {crit.awarded_marks.toFixed(2)} / {crit.max_marks.toFixed(2)} marks
-                    </span>
-                  </div>
-                  <div style={{ fontSize: '0.85rem', color: 'var(--text-primary)', marginTop: '0.35rem' }}>
-                    <strong>Feedback:</strong> {crit.feedback ? crit.feedback : <em style={{ color: 'var(--text-muted)' }}>Feedback skipped (score-only mode).</em>}
-                  </div>
-                  {crit.contradictions_detected && crit.contradictions_detected.length > 0 && (
-                    <div style={{ fontSize: '0.8rem', color: 'var(--danger)', marginTop: '0.25rem' }}>
-                      ⚠️ <strong>Contradiction:</strong> {crit.contradictions_detected.join('; ')}
+            {selectedBatchItem.question_results && selectedBatchItem.question_results.length > 1 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {selectedBatchItem.question_results.map((qRes, qIdx) => (
+                  <div key={qRes.question_id || qIdx} style={{
+                    border: '1px solid var(--border)',
+                    borderRadius: '8px',
+                    padding: '0.85rem 1rem',
+                    backgroundColor: '#ffffff'
+                  }}>
+                    <div className="flex-between" style={{ marginBottom: '0.5rem' }}>
+                      <strong style={{ fontSize: '0.95rem', color: 'var(--primary)' }}>
+                        Q{qRes.question_order}: {qRes.question_text}
+                      </strong>
+                      <span className="badge badge-neutral">
+                        {qRes.awarded_marks.toFixed(2)} / {qRes.max_marks.toFixed(2)} marks
+                      </span>
                     </div>
-                  )}
-                  {crit.missing_concepts && crit.missing_concepts.length > 0 && (
-                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-                      <em>Missing:</em> {crit.missing_concepts.join('; ')}
+
+                    {qRes.student_answer_slice ? (
+                      <details style={{ marginBottom: '0.5rem', backgroundColor: 'var(--bg-main)', borderRadius: '4px', padding: '0.35rem 0.5rem' }}>
+                        <summary style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                          📄 Segmented Answer Slice
+                        </summary>
+                        <p style={{ fontSize: '0.8rem', whiteSpace: 'pre-wrap', margin: '0.35rem 0 0 0' }}>
+                          {qRes.student_answer_slice}
+                        </p>
+                      </details>
+                    ) : (
+                      <div style={{ fontSize: '0.75rem', color: 'var(--danger)', fontStyle: 'italic', marginBottom: '0.5rem' }}>
+                        ⚠️ Skipped / No answer submitted
+                      </div>
+                    )}
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                      {qRes.criterion_breakdown && qRes.criterion_breakdown.map((crit, cIdx) => (
+                        <div key={cIdx} style={{
+                          border: '1px solid var(--border)',
+                          borderRadius: '6px',
+                          padding: '0.65rem 0.75rem',
+                          backgroundColor: 'var(--bg-main)'
+                        }}>
+                          <div className="flex-between" style={{ marginBottom: '0.25rem' }}>
+                            <strong style={{ fontSize: '0.85rem' }}>{crit.criterion_name}</strong>
+                            <span style={{ fontSize: '0.8rem', fontWeight: 600 }}>
+                              {crit.awarded_marks.toFixed(2)} / {crit.max_marks.toFixed(2)}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: '0.8rem', color: 'var(--text-primary)' }}>
+                            <strong>Feedback:</strong> {crit.feedback ? crit.feedback : <em style={{ color: 'var(--text-muted)' }}>Feedback skipped (score-only mode).</em>}
+                          </div>
+                          {crit.contradictions_detected && crit.contradictions_detected.length > 0 && (
+                            <div style={{ fontSize: '0.75rem', color: 'var(--danger)', marginTop: '0.2rem' }}>
+                              ⚠️ <strong>Contradiction:</strong> {crit.contradictions_detected.join('; ')}
+                            </div>
+                          )}
+                          {crit.missing_concepts && crit.missing_concepts.length > 0 && (
+                            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.2rem' }}>
+                              <em>Missing:</em> {crit.missing_concepts.join('; ')}
+                            </div>
+                          )}
+                        </div>
+                      ))}
                     </div>
-                  )}
-                </div>
-              ))}
-            </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                {selectedBatchItem.criterion_breakdown && selectedBatchItem.criterion_breakdown.map((crit, idx) => (
+                  <div key={idx} style={{
+                    border: '1px solid var(--border)',
+                    borderRadius: '6px',
+                    padding: '0.85rem',
+                    backgroundColor: 'var(--bg-main)'
+                  }}>
+                    <div className="flex-between" style={{ marginBottom: '0.35rem' }}>
+                      <strong style={{ fontSize: '0.9rem' }}>{crit.criterion_name}</strong>
+                      <span className="badge badge-neutral">
+                        {crit.awarded_marks.toFixed(2)} / {crit.max_marks.toFixed(2)} marks
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '0.85rem', color: 'var(--text-primary)', marginTop: '0.35rem' }}>
+                      <strong>Feedback:</strong> {crit.feedback ? crit.feedback : <em style={{ color: 'var(--text-muted)' }}>Feedback skipped (score-only mode).</em>}
+                    </div>
+                    {crit.contradictions_detected && crit.contradictions_detected.length > 0 && (
+                      <div style={{ fontSize: '0.8rem', color: 'var(--danger)', marginTop: '0.25rem' }}>
+                        ⚠️ <strong>Contradiction:</strong> {crit.contradictions_detected.join('; ')}
+                      </div>
+                    )}
+                    {crit.missing_concepts && crit.missing_concepts.length > 0 && (
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
+                        <em>Missing:</em> {crit.missing_concepts.join('; ')}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div style={{ textAlign: 'right', marginTop: '1.25rem' }}>
               <button

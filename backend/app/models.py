@@ -35,22 +35,41 @@ class RubricCriterionResponse(BaseModel):
     name: str
     description: str
     max_marks: float
+    question_id: Optional[str] = None
+
+class AssessmentQuestionCreate(BaseModel):
+    question_order: Optional[int] = Field(None, description="1-indexed question order")
+    question_text: str = Field(..., min_length=1, description="Question or assignment prompt")
+    model_answer: Optional[str] = Field(None, description="Authoritative model answer")
+    max_marks: Optional[float] = Field(None, description="Max marks for this question (summed from criteria if omitted)")
+    criteria: List[RubricCriterionCreate] = Field(..., min_length=1, description="Rubric criteria for this question")
+
+class AssessmentQuestionResponse(BaseModel):
+    id: str
+    assessment_id: str
+    question_order: int
+    question_text: str
+    model_answer: Optional[str] = None
+    max_marks: float
+    criteria: List[RubricCriterionResponse] = Field(default_factory=list)
 
 class AssessmentCreate(BaseModel):
     title: str = Field(..., min_length=1, description="Assessment title")
-    question: str = Field(..., min_length=1, description="Question or assignment prompt")
-    model_answer: str = Field(..., min_length=1, description="Authoritative model answer")
-    total_marks: float = Field(..., gt=0, description="Total maximum marks")
+    question: Optional[str] = Field(None, description="Question or assignment prompt")
+    model_answer: Optional[str] = Field(None, description="Authoritative model answer")
+    total_marks: Optional[float] = Field(None, description="Total maximum marks")
     doc_scope: str = Field("ALL", description="'ALL' or comma-separated document IDs")
-    criteria: List[RubricCriterionCreate] = Field(..., min_length=1, description="Rubric criteria")
+    criteria: Optional[List[RubricCriterionCreate]] = Field(None, description="Rubric criteria")
+    questions: Optional[List[AssessmentQuestionCreate]] = Field(None, description="Multi-question assessment questions")
 
 class AssessmentUpdate(BaseModel):
     title: str
-    question: str
-    model_answer: str
-    total_marks: float
+    question: Optional[str] = None
+    model_answer: Optional[str] = None
+    total_marks: Optional[float] = None
     doc_scope: str = "ALL"
-    criteria: List[RubricCriterionCreate]
+    criteria: Optional[List[RubricCriterionCreate]] = None
+    questions: Optional[List[AssessmentQuestionCreate]] = None
 
 class AssessmentResponse(BaseModel):
     id: str
@@ -60,6 +79,7 @@ class AssessmentResponse(BaseModel):
     total_marks: float
     doc_scope: str
     criteria: List[RubricCriterionResponse]
+    questions: Optional[List[AssessmentQuestionResponse]] = None
     created_at: str
     updated_at: str
 
@@ -100,6 +120,22 @@ class CriterionGradingResult(BaseModel):
     uce_signals: Optional[UCEScores] = None
     supporting_citations: List[EvidenceCitation] = Field(default_factory=list)
 
+class QuestionGradingResult(BaseModel):
+    question_id: str
+    question_order: int
+    question_text: str
+    model_answer: Optional[str] = None
+    student_answer_slice: str = ""
+    awarded_marks: float
+    max_marks: float
+    percentage: float = 0.0
+    criterion_breakdown: List[CriterionGradingResult] = Field(default_factory=list)
+    requires_teacher_review: bool = False
+    review_reasons: List[str] = Field(default_factory=list)
+    feedback: str = ""
+    question_feedback: str = ""
+    citations: List[EvidenceCitation] = Field(default_factory=list)
+
 class GradingResponse(BaseModel):
     assessment_id: str
     assessment_title: str
@@ -112,6 +148,7 @@ class GradingResponse(BaseModel):
     review_reasons: List[str]
     citations: List[EvidenceCitation]
     provenance: Dict[str, Any]
+    question_results: Optional[List[QuestionGradingResult]] = None
 
 # -------------------------------------------------------------
 # Health and System Status
@@ -142,6 +179,7 @@ class BatchItemResult(BaseModel):
     stage_durations: Optional[Dict[str, float]] = None
     extraction_ms: Optional[float] = None
     persistence_ms: Optional[float] = None
+    question_results: Optional[List[QuestionGradingResult]] = None
 
 class BatchJobResponse(BaseModel):
     batch_id: str

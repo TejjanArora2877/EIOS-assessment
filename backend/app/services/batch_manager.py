@@ -278,7 +278,8 @@ class BatchManager:
                         ollama_calls=calls_count,
                         stage_durations=stage_durations,
                         extraction_ms=round(ext_ms, 2),
-                        persistence_ms=round(persist_ms, 2)
+                        persistence_ms=round(persist_ms, 2),
+                        question_results=getattr(grading_response, "question_results", None)
                     )
                     with cls._lock:
                         if batch_id in cls._batches:

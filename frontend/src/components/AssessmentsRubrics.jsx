@@ -14,13 +14,18 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
 
   // Form fields
   const [title, setTitle] = useState('');
-  const [question, setQuestion] = useState('');
-  const [modelAnswer, setModelAnswer] = useState('');
   const [totalMarks, setTotalMarks] = useState(10);
   const [docScope, setDocScope] = useState('ALL');
-  const [criteria, setCriteria] = useState([
-    { name: '', description: '', max_marks: 5 },
-    { name: '', description: '', max_marks: 5 },
+  const [questions, setQuestions] = useState([
+    {
+      question_order: 1,
+      question_text: '',
+      model_answer: '',
+      criteria: [
+        { name: '', description: '', max_marks: 5 },
+        { name: '', description: '', max_marks: 5 },
+      ]
+    }
   ]);
 
   // Deletion modal
@@ -50,13 +55,18 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
 
   const openCreateForm = () => {
     setTitle('');
-    setQuestion('');
-    setModelAnswer('');
     setTotalMarks(10);
     setDocScope('ALL');
-    setCriteria([
-      { name: '', description: '', max_marks: 5 },
-      { name: '', description: '', max_marks: 5 },
+    setQuestions([
+      {
+        question_order: 1,
+        question_text: '',
+        model_answer: '',
+        criteria: [
+          { name: '', description: '', max_marks: 5 },
+          { name: '', description: '', max_marks: 5 },
+        ]
+      }
     ]);
     setEditingId(null);
     setFormMode('create');
@@ -66,46 +76,105 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
 
   const openEditForm = (assessment) => {
     setTitle(assessment.title);
-    setQuestion(assessment.question);
-    setModelAnswer(assessment.model_answer);
     setTotalMarks(assessment.total_marks);
-    setDocScope(assessment.doc_scope);
-    setCriteria(assessment.criteria.map(c => ({
-      name: c.name,
-      description: c.description,
-      max_marks: c.max_marks
-    })));
+    setDocScope(assessment.doc_scope || 'ALL');
+
+    if (assessment.questions && assessment.questions.length > 0) {
+      setQuestions(assessment.questions.map((q, idx) => ({
+        id: q.id,
+        question_order: q.question_order || idx + 1,
+        question_text: q.question_text || '',
+        model_answer: q.model_answer || '',
+        criteria: (q.criteria && q.criteria.length > 0 ? q.criteria : []).map(c => ({
+          name: c.name,
+          description: c.description,
+          max_marks: c.max_marks
+        }))
+      })));
+    } else {
+      setQuestions([
+        {
+          question_order: 1,
+          question_text: assessment.question || '',
+          model_answer: assessment.model_answer || '',
+          criteria: (assessment.criteria || []).map(c => ({
+            name: c.name,
+            description: c.description,
+            max_marks: c.max_marks
+          }))
+        }
+      ]);
+    }
+
     setEditingId(assessment.id);
     setFormMode('edit');
     setError(null);
     setSuccessMsg(null);
   };
 
-  const handleAddCriterion = () => {
-    setCriteria([...criteria, { name: '', description: '', max_marks: 1 }]);
+  const handleAddQuestion = () => {
+    setQuestions([
+      ...questions,
+      {
+        question_order: questions.length + 1,
+        question_text: '',
+        model_answer: '',
+        criteria: [
+          { name: '', description: '', max_marks: 5 }
+        ]
+      }
+    ]);
   };
 
-  const handleRemoveCriterion = (index) => {
-    if (criteria.length <= 1) {
-      setError('An assessment must have at least one rubric criterion.');
+  const handleRemoveQuestion = (qIndex) => {
+    if (questions.length <= 1) {
+      setError('An assessment must have at least one question.');
       return;
     }
-    const updated = criteria.filter((_, i) => i !== index);
-    setCriteria(updated);
+    const updated = questions
+      .filter((_, i) => i !== qIndex)
+      .map((q, idx) => ({ ...q, question_order: idx + 1 }));
+    setQuestions(updated);
   };
 
-  const handleCriterionChange = (index, field, value) => {
-    const updated = [...criteria];
-    if (field === 'max_marks') {
-      updated[index][field] = parseFloat(value) || 0;
-    } else {
-      updated[index][field] = value;
+  const handleQuestionChange = (qIndex, field, value) => {
+    const updated = [...questions];
+    updated[qIndex][field] = value;
+    setQuestions(updated);
+  };
+
+  const handleAddCriterion = (qIndex) => {
+    const updated = [...questions];
+    updated[qIndex].criteria.push({ name: '', description: '', max_marks: 5 });
+    setQuestions(updated);
+  };
+
+  const handleRemoveCriterion = (qIndex, critIndex) => {
+    const updated = [...questions];
+    if (updated[qIndex].criteria.length <= 1) {
+      setError(`Question #${qIndex + 1} must have at least one rubric criterion.`);
+      return;
     }
-    setCriteria(updated);
+    updated[qIndex].criteria = updated[qIndex].criteria.filter((_, i) => i !== critIndex);
+    setQuestions(updated);
   };
 
-  const criteriaSum = criteria.reduce((sum, c) => sum + (parseFloat(c.max_marks) || 0), 0);
-  const marksMatch = Math.abs(criteriaSum - parseFloat(totalMarks || 0)) < 0.01;
+  const handleCriterionChange = (qIndex, critIndex, field, value) => {
+    const updated = [...questions];
+    if (field === 'max_marks') {
+      updated[qIndex].criteria[critIndex][field] = parseFloat(value) || 0;
+    } else {
+      updated[qIndex].criteria[critIndex][field] = value;
+    }
+    setQuestions(updated);
+  };
+
+  // Overall criteria sum across all questions
+  const totalCriteriaSum = questions.reduce(
+    (sum, q) => sum + q.criteria.reduce((s, c) => s + (parseFloat(c.max_marks) || 0), 0),
+    0
+  );
+  const marksMatch = Math.abs(totalCriteriaSum - parseFloat(totalMarks || 0)) < 0.01;
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -117,47 +186,70 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
       setError('Assessment title is required.');
       return;
     }
-    if (!question.trim()) {
-      setError('Question / assignment prompt is required.');
+    if (questions.length === 0) {
+      setError('At least one question is required.');
       return;
     }
-    if (!modelAnswer.trim()) {
-      setError('Authoritative model answer is required.');
-      return;
-    }
-    if (criteria.length === 0) {
-      setError('At least one rubric criterion is required.');
-      return;
-    }
-    for (let i = 0; i < criteria.length; i++) {
-      if (!criteria[i].name.trim()) {
-        setError(`Criterion #${i + 1} requires a name.`);
+
+    for (let qIdx = 0; qIdx < questions.length; qIdx++) {
+      const q = questions[qIdx];
+      if (!q.question_text.trim()) {
+        setError(`Question #${qIdx + 1}: Question text / prompt is required.`);
         return;
       }
-      if (!criteria[i].description.trim()) {
-        setError(`Criterion #${i + 1} requires a description.`);
+      if (!q.model_answer.trim()) {
+        setError(`Question #${qIdx + 1}: Authoritative model answer is required.`);
         return;
       }
-      if (criteria[i].max_marks <= 0) {
-        setError(`Criterion #${i + 1} marks must be greater than 0.`);
+      if (!q.criteria || q.criteria.length === 0) {
+        setError(`Question #${qIdx + 1}: At least one rubric criterion is required.`);
         return;
+      }
+      for (let cIdx = 0; cIdx < q.criteria.length; cIdx++) {
+        const c = q.criteria[cIdx];
+        if (!c.name.trim()) {
+          setError(`Question #${qIdx + 1}, Criterion #${cIdx + 1}: Name is required.`);
+          return;
+        }
+        if (!c.description.trim()) {
+          setError(`Question #${qIdx + 1}, Criterion #${cIdx + 1}: Description is required.`);
+          return;
+        }
+        if (c.max_marks <= 0) {
+          setError(`Question #${qIdx + 1}, Criterion #${cIdx + 1}: Marks must be greater than 0.`);
+          return;
+        }
       }
     }
+
     if (!marksMatch) {
-      setError(`Sum of criterion marks (${criteriaSum.toFixed(2)}) must equal total marks (${parseFloat(totalMarks).toFixed(2)}).`);
+      setError(
+        `Sum of criterion marks (${totalCriteriaSum.toFixed(2)}) must equal total maximum marks (${parseFloat(totalMarks).toFixed(2)}).`
+      );
       return;
     }
 
     const payload = {
       title: title.trim(),
-      question: question.trim(),
-      model_answer: modelAnswer.trim(),
+      question: questions[0]?.question_text?.trim() || '',
+      model_answer: questions[0]?.model_answer?.trim() || '',
       total_marks: parseFloat(totalMarks),
       doc_scope: docScope,
-      criteria: criteria.map(c => ({
+      criteria: questions.flatMap(q => q.criteria.map(c => ({
         name: c.name.trim(),
         description: c.description.trim(),
         max_marks: parseFloat(c.max_marks)
+      }))),
+      questions: questions.map((q, idx) => ({
+        question_order: idx + 1,
+        question_text: q.question_text.trim(),
+        model_answer: q.model_answer.trim(),
+        max_marks: q.criteria.reduce((sum, c) => sum + (parseFloat(c.max_marks) || 0), 0),
+        criteria: q.criteria.map(c => ({
+          name: c.name.trim(),
+          description: c.description.trim(),
+          max_marks: parseFloat(c.max_marks)
+        }))
       }))
     };
 
@@ -165,7 +257,7 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
       setLoading(true);
       if (formMode === 'create') {
         const created = await api.createAssessment(payload);
-        setSuccessMsg(`Assessment "${created.title}" saved successfully.`);
+        setSuccessMsg(`Assessment "${created.title}" saved successfully with ${questions.length} question(s).`);
         onSelectAssessment(created.id);
       } else {
         const updated = await api.updateAssessment(editingId, payload);
@@ -206,7 +298,7 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
           <div>
             <h2 className="card-title">Assessments & Rubrics</h2>
             <p className="card-description" style={{ marginBottom: 0 }}>
-              Define questions, model answers, and explicit teacher-defined criteria with maximum marks.
+              Define single or multi-question assessments with authoritative model answers and explicit rubric criteria.
             </p>
           </div>
           {formMode === null ? (
@@ -240,7 +332,7 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
                 id="assessment-title"
                 type="text"
                 className="form-input"
-                placeholder="e.g. Memory-Based Learning Concept Exam"
+                placeholder="e.g. Operating Systems Final Exam / Security Concepts Assessment"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
                 required
@@ -252,16 +344,27 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
                 <label className="form-label" htmlFor="assessment-total-marks">
                   Total Maximum Marks *
                 </label>
-                <input
-                  id="assessment-total-marks"
-                  type="number"
-                  step="0.5"
-                  min="0.5"
-                  className="form-input"
-                  value={totalMarks}
-                  onChange={(e) => setTotalMarks(e.target.value)}
-                  required
-                />
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <input
+                    id="assessment-total-marks"
+                    type="number"
+                    step="0.5"
+                    min="0.5"
+                    className="form-input"
+                    value={totalMarks}
+                    onChange={(e) => setTotalMarks(e.target.value)}
+                    required
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    title="Auto-set total marks from criteria sum"
+                    onClick={() => setTotalMarks(totalCriteriaSum)}
+                    style={{ whiteSpace: 'nowrap' }}
+                  >
+                    Auto-Sum ({totalCriteriaSum.toFixed(1)})
+                  </button>
+                </div>
               </div>
 
               <div className="form-group">
@@ -284,131 +387,183 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
               </div>
             </div>
 
-            <div className="form-group">
-              <label className="form-label" htmlFor="assessment-question">
-                Question / Assignment Prompt *
-              </label>
-              <textarea
-                id="assessment-question"
-                className="form-textarea"
-                rows="3"
-                placeholder="State the exact question given to students..."
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                required
-              />
-            </div>
-
-            <div className="form-group">
-              <label className="form-label" htmlFor="assessment-model-answer">
-                Authoritative Model Answer (Expected Concepts) *
-              </label>
-              <textarea
-                id="assessment-model-answer"
-                className="form-textarea"
-                rows="5"
-                placeholder="Provide the complete teacher's model answer containing all core concepts and technical details..."
-                value={modelAnswer}
-                onChange={(e) => setModelAnswer(e.target.value)}
-                required
-              />
-            </div>
-
-            {/* Rubric Criteria Section */}
+            {/* Questions Container */}
             <div style={{ marginTop: '1.5rem', marginBottom: '1.5rem' }}>
-              <div className="flex-between" style={{ marginBottom: '0.75rem' }}>
+              <div className="flex-between" style={{ marginBottom: '1rem' }}>
                 <div>
-                  <h4 style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
-                    Rubric Criteria ({criteria.length})
+                  <h4 style={{ fontWeight: 700, color: 'var(--text-primary)', fontSize: '1.1rem' }}>
+                    Assessment Questions ({questions.length})
                   </h4>
-                  <div style={{ fontSize: '0.85rem', color: marksMatch ? 'var(--success)' : 'var(--danger)' }}>
-                    Current Criteria Sum: <strong>{criteriaSum.toFixed(2)}</strong> / {parseFloat(totalMarks || 0).toFixed(2)} marks
+                  <div style={{ fontSize: '0.85rem', color: marksMatch ? 'var(--success)' : 'var(--danger)', marginTop: '0.2rem' }}>
+                    Criteria Sum: <strong>{totalCriteriaSum.toFixed(2)}</strong> / {parseFloat(totalMarks || 0).toFixed(2)} total marks
                     {marksMatch ? ' ✓ (Balanced)' : ' ⚠️ (Sum must equal total marks)'}
                   </div>
                 </div>
                 <button
                   type="button"
                   className="btn btn-secondary btn-sm"
-                  onClick={handleAddCriterion}
+                  onClick={handleAddQuestion}
                 >
-                  + Add Criterion
+                  + Add Question
                 </button>
               </div>
 
-              {criteria.map((crit, idx) => (
-                <div
-                  key={idx}
-                  style={{
-                    border: '1px solid var(--border)',
-                    borderRadius: '6px',
-                    padding: '1rem',
-                    marginBottom: '0.75rem',
-                    backgroundColor: 'var(--bg-main)'
-                  }}
-                >
-                  <div className="flex-between" style={{ marginBottom: '0.5rem' }}>
-                    <span style={{ fontWeight: 600, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                      Criterion #{idx + 1}
-                    </span>
-                    {criteria.length > 1 && (
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        style={{ color: 'var(--danger)', background: 'none', border: 'none', cursor: 'pointer' }}
-                        onClick={() => handleRemoveCriterion(idx)}
-                      >
-                        Remove
-                      </button>
-                    )}
-                  </div>
+              {questions.map((q, qIdx) => {
+                const qSubtotal = q.criteria.reduce((s, c) => s + (parseFloat(c.max_marks) || 0), 0);
 
-                  <div className="grid-2">
-                    <div className="form-group" style={{ marginBottom: '0.5rem' }}>
-                      <label className="form-label" style={{ fontSize: '0.8rem' }}>Criterion Name *</label>
-                      <input
-                        type="text"
-                        className="form-input"
-                        placeholder="e.g. Definition of MBL"
-                        value={crit.name}
-                        onChange={(e) => handleCriterionChange(idx, 'name', e.target.value)}
+                return (
+                  <div
+                    key={qIdx}
+                    style={{
+                      border: '2px solid var(--border)',
+                      borderRadius: '8px',
+                      padding: '1.25rem',
+                      marginBottom: '1.25rem',
+                      backgroundColor: '#fbfbfb'
+                    }}
+                  >
+                    <div className="flex-between" style={{ marginBottom: '0.75rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.5rem' }}>
+                      <span style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--primary)' }}>
+                        Question {qIdx + 1}
+                        <span className="badge badge-neutral" style={{ marginLeft: '0.5rem', fontWeight: 500 }}>
+                          Subtotal: {qSubtotal.toFixed(2)} Marks
+                        </span>
+                      </span>
+                      {questions.length > 1 && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          style={{ color: 'var(--danger)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}
+                          onClick={() => handleRemoveQuestion(qIdx)}
+                        >
+                          Remove Question
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label" style={{ fontSize: '0.85rem' }}>
+                        Question / Assignment Prompt *
+                      </label>
+                      <textarea
+                        className="form-textarea"
+                        rows="2"
+                        placeholder="State the exact question given to students (e.g. Distinguish passive vs active attacks)..."
+                        value={q.question_text}
+                        onChange={(e) => handleQuestionChange(qIdx, 'question_text', e.target.value)}
                         required
                       />
                     </div>
-                    <div className="form-group" style={{ marginBottom: '0.5rem' }}>
-                      <label className="form-label" style={{ fontSize: '0.8rem' }}>Max Marks *</label>
-                      <input
-                        type="number"
-                        step="0.5"
-                        min="0.5"
-                        className="form-input"
-                        value={crit.max_marks}
-                        onChange={(e) => handleCriterionChange(idx, 'max_marks', e.target.value)}
+
+                    <div className="form-group">
+                      <label className="form-label" style={{ fontSize: '0.85rem' }}>
+                        Authoritative Model Answer (Expected Concepts) *
+                      </label>
+                      <textarea
+                        className="form-textarea"
+                        rows="4"
+                        placeholder="Provide the complete teacher's model answer containing all core concepts for this question..."
+                        value={q.model_answer}
+                        onChange={(e) => handleQuestionChange(qIdx, 'model_answer', e.target.value)}
                         required
                       />
                     </div>
-                  </div>
 
-                  <div className="form-group" style={{ marginBottom: 0 }}>
-                    <label className="form-label" style={{ fontSize: '0.8rem' }}>Concept Description *</label>
-                    <input
-                      type="text"
-                      className="form-input"
-                      placeholder="Expected concepts, keywords, or properties to evaluate..."
-                      value={crit.description}
-                      onChange={(e) => handleCriterionChange(idx, 'description', e.target.value)}
-                      required
-                    />
+                    {/* Criteria Sub-section for this question */}
+                    <div style={{ marginTop: '1rem', borderTop: '1px dashed var(--border)', paddingTop: '0.75rem' }}>
+                      <div className="flex-between" style={{ marginBottom: '0.5rem' }}>
+                        <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                          Rubric Criteria for Question {qIdx + 1} ({q.criteria.length})
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          style={{ fontSize: '0.75rem', padding: '0.2rem 0.5rem' }}
+                          onClick={() => handleAddCriterion(qIdx)}
+                        >
+                          + Add Criterion
+                        </button>
+                      </div>
+
+                      {q.criteria.map((crit, cIdx) => (
+                        <div
+                          key={cIdx}
+                          style={{
+                            border: '1px solid var(--border)',
+                            borderRadius: '6px',
+                            padding: '0.75rem',
+                            marginBottom: '0.5rem',
+                            backgroundColor: '#ffffff'
+                          }}
+                        >
+                          <div className="flex-between" style={{ marginBottom: '0.35rem' }}>
+                            <span style={{ fontWeight: 600, fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                              Criterion #{cIdx + 1}
+                            </span>
+                            {q.criteria.length > 1 && (
+                              <button
+                                type="button"
+                                className="btn btn-sm"
+                                style={{ color: 'var(--danger)', background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.75rem' }}
+                                onClick={() => handleRemoveCriterion(qIdx, cIdx)}
+                              >
+                                Remove
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="grid-2">
+                            <div className="form-group" style={{ marginBottom: '0.35rem' }}>
+                              <label className="form-label" style={{ fontSize: '0.75rem' }}>Criterion Name *</label>
+                              <input
+                                type="text"
+                                className="form-input"
+                                placeholder="e.g. Definition of Cybersecurity"
+                                value={crit.name}
+                                onChange={(e) => handleCriterionChange(qIdx, cIdx, 'name', e.target.value)}
+                                required
+                              />
+                            </div>
+                            <div className="form-group" style={{ marginBottom: '0.35rem' }}>
+                              <label className="form-label" style={{ fontSize: '0.75rem' }}>Max Marks *</label>
+                              <input
+                                type="number"
+                                step="0.5"
+                                min="0.5"
+                                className="form-input"
+                                value={crit.max_marks}
+                                onChange={(e) => handleCriterionChange(qIdx, cIdx, 'max_marks', e.target.value)}
+                                required
+                              />
+                            </div>
+                          </div>
+
+                          <div className="form-group" style={{ marginBottom: 0 }}>
+                            <label className="form-label" style={{ fontSize: '0.75rem' }}>
+                              Description (Required Propositions & Concepts) *
+                            </label>
+                            <textarea
+                              className="form-textarea"
+                              rows="2"
+                              placeholder="Describe the exact technical facts the student must demonstrate..."
+                              value={crit.description}
+                              onChange={(e) => handleCriterionChange(qIdx, cIdx, 'description', e.target.value)}
+                              required
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
-            <div style={{ display: 'flex', gap: '1rem', justifyContent: 'flex-end' }}>
+            <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end', marginTop: '1.5rem' }}>
               <button
                 type="button"
                 className="btn btn-secondary"
                 onClick={() => setFormMode(null)}
-                disabled={loading}
               >
                 Cancel
               </button>
@@ -424,9 +579,9 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
         </div>
       )}
 
-      {/* Saved Assessments List */}
+      {/* List of Existing Assessments */}
       <div className="card">
-        <h3 className="card-title" style={{ marginBottom: '1rem' }}>
+        <h3 className="card-title" style={{ marginBottom: '1.25rem' }}>
           Saved Assessments ({assessments.length})
         </h3>
 
@@ -442,6 +597,8 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
             {assessments.map((a) => {
               const isSelected = selectedAssessmentId === a.id;
+              const hasMultipleQuestions = a.questions && a.questions.length > 1;
+
               return (
                 <div
                   key={a.id}
@@ -458,9 +615,20 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
                       <h4 style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--text-primary)' }}>
                         {a.title}
                       </h4>
-                      <span className="badge badge-neutral" style={{ marginTop: '0.25rem' }}>
-                        Total: {a.total_marks} Marks ({a.criteria.length} Criteria)
-                      </span>
+                      <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.25rem', flexWrap: 'wrap' }}>
+                        <span className="badge badge-neutral">
+                          Total: {a.total_marks} Marks
+                        </span>
+                        {hasMultipleQuestions ? (
+                          <span className="badge badge-neutral">
+                            {a.questions.length} Questions ({a.criteria?.length || 0} Total Criteria)
+                          </span>
+                        ) : (
+                          <span className="badge badge-neutral">
+                            1 Question ({a.criteria?.length || 0} Criteria)
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <div style={{ display: 'flex', gap: '0.5rem' }}>
                       <button
@@ -484,27 +652,66 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
                     </div>
                   </div>
 
-                  <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
-                    <strong>Question:</strong> {a.question}
-                  </p>
+                  {hasMultipleQuestions ? (
+                    <div style={{ marginTop: '0.75rem' }}>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '0.35rem' }}>
+                        Questions & Rubric Breakdown:
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                        {a.questions.map((q, qIdx) => (
+                          <div
+                            key={q.id || qIdx}
+                            style={{
+                              backgroundColor: isSelected ? '#ffffff' : 'var(--bg-main)',
+                              padding: '0.65rem 0.85rem',
+                              borderRadius: '6px',
+                              fontSize: '0.8rem'
+                            }}
+                          >
+                            <div className="flex-between" style={{ marginBottom: '0.25rem' }}>
+                              <strong style={{ color: 'var(--text-primary)' }}>
+                                Q{q.question_order || qIdx + 1}: {q.question_text}
+                              </strong>
+                              <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>
+                                {q.max_marks} marks
+                              </span>
+                            </div>
+                            <ul style={{ paddingLeft: '1.25rem', margin: 0, color: 'var(--text-secondary)' }}>
+                              {(q.criteria || []).map((c) => (
+                                <li key={c.id || c.name}>
+                                  <strong>{c.name}</strong> ({c.max_marks} marks): {c.description}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
+                        <strong>Question:</strong> {a.question}
+                      </p>
 
-                  <div style={{
-                    backgroundColor: isSelected ? '#ffffff' : 'var(--bg-main)',
-                    padding: '0.75rem',
-                    borderRadius: '6px',
-                    fontSize: '0.8rem',
-                  }}>
-                    <strong style={{ display: 'block', marginBottom: '0.25rem', color: 'var(--text-primary)' }}>
-                      Rubric Breakdown:
-                    </strong>
-                    <ul style={{ paddingLeft: '1.25rem', color: 'var(--text-secondary)' }}>
-                      {a.criteria.map((c) => (
-                        <li key={c.id}>
-                          <strong>{c.name}</strong> ({c.max_marks} marks): {c.description}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
+                      <div style={{
+                        backgroundColor: isSelected ? '#ffffff' : 'var(--bg-main)',
+                        padding: '0.75rem',
+                        borderRadius: '6px',
+                        fontSize: '0.8rem',
+                      }}>
+                        <strong style={{ display: 'block', marginBottom: '0.25rem', color: 'var(--text-primary)' }}>
+                          Rubric Breakdown:
+                        </strong>
+                        <ul style={{ paddingLeft: '1.25rem', color: 'var(--text-secondary)' }}>
+                          {(a.criteria || []).map((c) => (
+                            <li key={c.id || c.name}>
+                              <strong>{c.name}</strong> ({c.max_marks} marks): {c.description}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </>
+                  )}
                 </div>
               );
             })}
@@ -539,7 +746,7 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
             </h3>
             <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginBottom: '1.25rem' }}>
               Are you sure you want to delete <strong>"{assessmentToDelete.title}"</strong>?
-              This will permanently remove the question, model answer, and its rubric criteria.
+              This will permanently remove the questions, model answers, and rubric criteria.
             </p>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
               <button

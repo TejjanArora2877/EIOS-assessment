@@ -487,3 +487,90 @@ def test_deterministic_zero_mark_criterion_feedback():
     assert "The response does not address 'Security Services'" in fb
     assert "Expected concepts to address: Confidentiality service; Integrity service." in fb
     assert fb.endswith(".")
+
+
+def test_full_mark_concept_purging_and_llm_bypass():
+    """
+    Verifies that when a criterion receives full marks (awarded_marks >= max_marks):
+    1. missing_concepts is purged to []
+    2. contradictions_detected is purged to []
+    3. feedback is set to deterministic:
+       "All expected concepts for '{criterion_name}' were accurately and comprehensively addressed."
+    4. Feedback generation bypasses Ollama (ollama_called == False).
+    """
+    with patch("backend.app.services.llm_feedback.LLMFeedbackService.get_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        fb_stats = {}
+        res, _ = GradingEngine.evaluate_criterion(
+            question="What is Memory-Based Learning?",
+            criterion_name="MBL Characteristics",
+            criterion_description="MBL is a versatile and efficient learning framework.",
+            max_marks=2.0,
+            model_answer="MBL is a versatile and efficient learning framework.",
+            student_text="MBL is a versatile and efficient learning framework.",
+            citations=[],
+            feedback_mode="hybrid",
+            feedback_stats=fb_stats
+        )
+
+        assert res.awarded_marks == 2.0
+        assert res.missing_concepts == []
+        assert res.contradictions_detected == []
+        assert res.feedback == "All expected concepts for 'MBL Characteristics' were accurately and comprehensively addressed."
+        assert fb_stats.get("ollama_called") is False
+        assert fb_stats.get("deterministic_reason") == "full_marks"
+        mock_client.post.assert_not_called()
+
+
+def test_proposition_and_missing_concepts_punctuation_cleaned():
+    """
+    Verifies that proposition cleaning and missing concept enumeration do not leave
+    double punctuation such as ';,', '.;', or '..'.
+    """
+    p1 = GradingEngine._clean_proposition("Confidentiality;, integrity..")
+    assert p1 == "Confidentiality, integrity."
+    assert ";," not in p1
+    assert ".." not in p1
+
+    p2 = GradingEngine._clean_proposition("Nonrepudiation.; availability..")
+    assert p2 == "Nonrepudiation; availability."
+    assert ".;" not in p2
+    assert ".." not in p2
+
+    m = LLMFeedbackService._format_missing_concepts(
+        ["nonrepudiation;,", "availability service.."],
+        criterion_name="Security mechanisms"
+    )
+    assert m == "Missing elements: nonrepudiation; availability service"
+    assert ";," not in m
+    assert ".." not in m
+
+    m_alias = GradingEngine._format_missing_concepts(
+        ["nonrepudiation;,", "availability service.."],
+        criterion_name="Security mechanisms"
+    )
+    assert m_alias == m
+
+
+def test_overall_feedback_deterministic_on_high_score():
+    """
+    Verifies that submissions scoring >= 95% without review flags immediately receive
+    a standardized deterministic commendation without invoking Ollama.
+    """
+    with patch("backend.app.services.llm_feedback.LLMFeedbackService.get_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        fb = LLMFeedbackService.generate_overall_feedback(
+            question="Explain computer network security concepts.",
+            total_score=19.5,
+            max_score=20.0,
+            review_reasons=[],
+            feedback_mode="hybrid"
+        )
+
+        assert fb == "Comprehensive and accurate response. All core concepts across all criteria were thoroughly demonstrated."
+        mock_get_client.assert_not_called()
+        mock_client.post.assert_not_called()

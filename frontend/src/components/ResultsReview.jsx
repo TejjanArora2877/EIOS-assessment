@@ -1,5 +1,102 @@
 import React from 'react';
 
+function CriterionCard({ crit, getScoreColor }) {
+  const critPct = crit.max_marks > 0 ? (crit.awarded_marks / crit.max_marks) * 100 : 0;
+  const isFullMarks = crit.awarded_marks >= crit.max_marks;
+  const isZeroMarks = crit.awarded_marks === 0;
+
+  return (
+    <div className="criterion-result-card">
+      <div>
+        {/* Criterion Header Row */}
+        <div className="flex-between" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '0.75rem' }}>
+          <div style={{ flex: '1 1 240px', minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+              <h4 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-primary)', wordBreak: 'break-word' }}>
+                {crit.criterion_name}
+              </h4>
+              {isFullMarks && (
+                <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
+                  ✓ Full Marks
+                </span>
+              )}
+              {isZeroMarks && (
+                <span className="badge badge-danger" style={{ fontSize: '0.7rem' }}>
+                  Zero Marks
+                </span>
+              )}
+            </div>
+            <p style={{ fontSize: '0.825rem', color: 'var(--text-secondary)', marginTop: '0.2rem', lineHeight: 1.4 }}>
+              {crit.reason}
+            </p>
+          </div>
+
+          <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+            <span style={{
+              fontSize: '1.25rem',
+              fontWeight: 800,
+              color: getScoreColor(critPct)
+            }}>
+              {crit.awarded_marks.toFixed(2)} / {crit.max_marks.toFixed(2)}
+            </span>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginLeft: '0.35rem' }}>
+              ({critPct.toFixed(0)}%)
+            </span>
+          </div>
+        </div>
+
+        {/* Contradictions Alert */}
+        {crit.contradictions_detected && crit.contradictions_detected.length > 0 && (
+          <div className="alert alert-danger" style={{ padding: '0.6rem 0.85rem', marginBottom: '0.65rem', fontSize: '0.825rem' }}>
+            <strong>Contradictions Detected:</strong>
+            <ul style={{ paddingLeft: '1.15rem', marginTop: '0.25rem' }}>
+              {crit.contradictions_detected.map((cd, cIdx) => (
+                <li key={cIdx}>{cd}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Missing Concepts Alert */}
+        {crit.missing_concepts && crit.missing_concepts.length > 0 && crit.awarded_marks < crit.max_marks && (
+          <div style={{
+            padding: '0.6rem 0.85rem',
+            borderRadius: '6px',
+            backgroundColor: 'var(--warning-bg)',
+            border: '1px solid rgba(180, 83, 9, 0.25)',
+            fontSize: '0.825rem',
+            color: 'var(--warning)',
+            marginBottom: '0.65rem'
+          }}>
+            <strong>Missing or Incomplete Concepts:</strong>
+            <ul style={{ paddingLeft: '1.15rem', marginTop: '0.25rem' }}>
+              {crit.missing_concepts.map((mc, mIdx) => (
+                <li key={mIdx}>{mc}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      {/* Constructive LLM Feedback Panel */}
+      <div className="feedback-panel">
+        <strong style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.825rem', color: 'var(--primary)' }}>
+          Constructive Feedback:
+        </strong>
+        {crit.feedback ? (
+          <p className="results-text-full" style={{ margin: 0, fontSize: '0.9rem', color: 'var(--text-primary)' }}>
+            {crit.feedback}
+          </p>
+        ) : (
+          <p className="results-text-full" style={{ margin: 0, fontSize: '0.85rem', fontStyle: 'italic', color: 'var(--text-muted)' }}>
+            Feedback skipped (score-only mode).
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function ResultsReview({ result, onNewEvaluation }) {
   if (!result) {
     return (
@@ -26,7 +123,8 @@ export default function ResultsReview({ result, onNewEvaluation }) {
     requires_teacher_review,
     review_reasons,
     citations,
-    provenance
+    provenance,
+    question_results
   } = result;
 
   const getScoreColor = (pct) => {
@@ -36,6 +134,7 @@ export default function ResultsReview({ result, onNewEvaluation }) {
   };
 
   const isLowScoreOrIrrelevant = total_score === 0 || percentage < 30;
+  const hasMultipleQuestions = question_results && question_results.length > 1;
 
   return (
     <div className="results-container">
@@ -52,6 +151,7 @@ export default function ResultsReview({ result, onNewEvaluation }) {
             <div style={{ fontSize: '0.825rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
               Evaluated via EIOS RAG Engine • Submission Type: <strong>{provenance?.submission_type || 'text'}</strong>
               {provenance?.submission_filename ? ` (${provenance.submission_filename})` : ''}
+              {hasMultipleQuestions && ` • ${question_results.length} Questions`}
             </div>
           </div>
 
@@ -114,118 +214,87 @@ export default function ResultsReview({ result, onNewEvaluation }) {
         </div>
       </div>
 
-      {/* Criterion Breakdown Section */}
-      <div className="card" style={{ padding: '1.25rem 1.5rem', marginBottom: '1.25rem' }}>
-        <div className="flex-between" style={{ marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-          <div>
-            <h3 className="card-title" style={{ fontSize: '1.2rem' }}>
-              Criterion-Wise Evaluation Breakdown ({criterion_breakdown.length})
-            </h3>
-            <p className="card-description" style={{ marginBottom: 0, fontSize: '0.825rem' }}>
-              Transparent, objective assessment per rubric requirement.
-            </p>
-          </div>
-        </div>
-
-        <div className="criteria-results-grid">
-          {criterion_breakdown.map((crit, idx) => {
-            const critPct = crit.max_marks > 0 ? (crit.awarded_marks / crit.max_marks) * 100 : 0;
-            const isFullMarks = crit.awarded_marks >= crit.max_marks;
-            const isZeroMarks = crit.awarded_marks === 0;
+      {/* Multi-Question Breakdown Cards */}
+      {hasMultipleQuestions ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', marginBottom: '1.25rem' }}>
+          {question_results.map((qRes, qIdx) => {
+            const qPct = qRes.max_marks > 0 ? (qRes.awarded_marks / qRes.max_marks) * 100 : 0;
 
             return (
-              <div key={idx} className="criterion-result-card">
-                <div>
-                  {/* Criterion Header Row */}
-                  <div className="flex-between" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '0.75rem' }}>
-                    <div style={{ flex: '1 1 240px', minWidth: 0 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
-                        <h4 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-primary)', wordBreak: 'break-word' }}>
-                          {crit.criterion_name}
-                        </h4>
-                        {isFullMarks && (
-                          <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
-                            ✓ Full Marks
-                          </span>
-                        )}
-                        {isZeroMarks && (
-                          <span className="badge badge-danger" style={{ fontSize: '0.7rem' }}>
-                            Zero Marks
-                          </span>
-                        )}
-                      </div>
-                      <p style={{ fontSize: '0.825rem', color: 'var(--text-secondary)', marginTop: '0.2rem', lineHeight: 1.4 }}>
-                        {crit.reason}
-                      </p>
-                    </div>
-
-                    <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                      <span style={{
-                        fontSize: '1.25rem',
-                        fontWeight: 800,
-                        color: getScoreColor(critPct)
-                      }}>
-                        {crit.awarded_marks.toFixed(2)} / {crit.max_marks.toFixed(2)}
-                      </span>
-                      <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginLeft: '0.35rem' }}>
-                        ({critPct.toFixed(0)}%)
-                      </span>
+              <div key={qRes.question_id || qIdx} className="card" style={{ padding: '1.25rem 1.5rem', marginBottom: 0 }}>
+                <div className="flex-between" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                  <div style={{ flex: '1 1 500px', minWidth: 0 }}>
+                    <span className="badge badge-neutral" style={{ marginBottom: '0.25rem', display: 'inline-block' }}>
+                      Question {qRes.question_order}
+                    </span>
+                    <h3 style={{ fontSize: '1.15rem', fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>
+                      {qRes.question_text}
+                    </h3>
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <span style={{ fontSize: '1.4rem', fontWeight: 800, color: getScoreColor(qPct) }}>
+                      {qRes.awarded_marks.toFixed(2)} / {qRes.max_marks.toFixed(2)}
+                    </span>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                      ({qPct.toFixed(1)}%)
                     </div>
                   </div>
-
-                  {/* Contradictions Alert */}
-                  {crit.contradictions_detected && crit.contradictions_detected.length > 0 && (
-                    <div className="alert alert-danger" style={{ padding: '0.6rem 0.85rem', marginBottom: '0.65rem', fontSize: '0.825rem' }}>
-                      <strong>Contradictions Detected:</strong>
-                      <ul style={{ paddingLeft: '1.15rem', marginTop: '0.25rem' }}>
-                        {crit.contradictions_detected.map((cd, cIdx) => (
-                          <li key={cIdx}>{cd}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-
-                  {/* Missing Concepts Alert */}
-                  {crit.missing_concepts && crit.missing_concepts.length > 0 && crit.awarded_marks < crit.max_marks && (
-                    <div style={{
-                      padding: '0.6rem 0.85rem',
-                      borderRadius: '6px',
-                      backgroundColor: 'var(--warning-bg)',
-                      border: '1px solid rgba(180, 83, 9, 0.25)',
-                      fontSize: '0.825rem',
-                      color: 'var(--warning)',
-                      marginBottom: '0.65rem'
-                    }}>
-                      <strong>Missing or Incomplete Concepts:</strong>
-                      <ul style={{ paddingLeft: '1.15rem', marginTop: '0.25rem' }}>
-                        {crit.missing_concepts.map((mc, mIdx) => (
-                          <li key={mIdx}>{mc}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
                 </div>
 
-                {/* Constructive LLM Feedback Panel */}
-                <div className="feedback-panel">
-                  <strong style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.825rem', color: 'var(--primary)' }}>
-                    Constructive Feedback:
-                  </strong>
-                  {crit.feedback ? (
-                    <p className="results-text-full" style={{ margin: 0, fontSize: '0.9rem', color: 'var(--text-primary)' }}>
-                      {crit.feedback}
+                {/* Segmented Answer Preview */}
+                {qRes.student_answer_slice ? (
+                  <details style={{ marginBottom: '0.75rem', backgroundColor: 'var(--bg-main)', borderRadius: '6px', padding: '0.5rem 0.75rem' }}>
+                    <summary style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                      📄 View Segmented Student Answer ({qRes.student_answer_slice.split(/\s+/).length} words)
+                    </summary>
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-primary)', whiteSpace: 'pre-wrap', marginTop: '0.5rem', margin: '0.5rem 0 0 0', lineHeight: 1.5 }}>
+                      {qRes.student_answer_slice}
                     </p>
-                  ) : (
-                    <p className="results-text-full" style={{ margin: 0, fontSize: '0.85rem', fontStyle: 'italic', color: 'var(--text-muted)' }}>
-                      Feedback skipped (score-only mode).
-                    </p>
-                  )}
+                  </details>
+                ) : (
+                  <div style={{ fontSize: '0.825rem', color: 'var(--danger)', fontStyle: 'italic', marginBottom: '0.75rem' }}>
+                    ⚠️ Question was skipped (no answer detected in submission).
+                  </div>
+                )}
+
+                {/* Question Feedback */}
+                {qRes.question_feedback && (
+                  <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.75rem', padding: '0.5rem 0.75rem', backgroundColor: '#fdfdfd', borderLeft: '3px solid var(--primary)', borderRadius: '4px' }}>
+                    <strong>Question Feedback:</strong> {qRes.question_feedback}
+                  </div>
+                )}
+
+                {/* Criteria Breakdown Grid */}
+                <div className="criteria-results-grid">
+                  {(qRes.criterion_breakdown || []).map((crit, cIdx) => (
+                    <CriterionCard key={cIdx} crit={crit} getScoreColor={getScoreColor} />
+                  ))}
                 </div>
               </div>
             );
           })}
         </div>
-      </div>
+      ) : (
+        /* Single-Question Flat Breakdown */
+        <div className="card" style={{ padding: '1.25rem 1.5rem', marginBottom: '1.25rem' }}>
+          <div className="flex-between" style={{ marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <div>
+              <h3 className="card-title" style={{ fontSize: '1.2rem' }}>
+                Criterion-Wise Evaluation Breakdown ({criterion_breakdown.length})
+              </h3>
+              <p className="card-description" style={{ marginBottom: 0, fontSize: '0.825rem' }}>
+                Transparent, objective assessment per rubric requirement.
+              </p>
+            </div>
+          </div>
+
+          <div className="criteria-results-grid">
+            {criterion_breakdown.map((crit, idx) => (
+              <CriterionCard key={idx} crit={crit} getScoreColor={getScoreColor} />
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Institutional Reference Materials */}
       <div className="card" style={{ padding: '1.25rem 1.5rem', marginBottom: '1.25rem' }}>
