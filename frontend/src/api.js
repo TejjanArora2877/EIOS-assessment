@@ -92,6 +92,16 @@ export const api = {
     return handleResponse(res);
   },
 
+  async parseAssessmentDocument(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/assessments/parse-document`, {
+      method: 'POST',
+      body: formData,
+    });
+    return handleResponse(res);
+  },
+
   // Section 3: Grade Student Answers
   async gradePastedText(assessmentId, studentText, feedbackMode = 'hybrid') {
     const payload = {
@@ -146,5 +156,30 @@ export const api = {
 
   getBatchCsvUrl(batchId) {
     return `${API_BASE}/grading/batch/${batchId}/csv`;
+  },
+
+  async fetchGradingRecords(assessmentId = '') {
+    const url = assessmentId
+      ? `${API_BASE}/grading/records?assessment_id=${encodeURIComponent(assessmentId)}`
+      : `${API_BASE}/grading/records`;
+    const res = await fetch(url);
+    return handleResponse(res);
+  },
+
+  async deleteGradingRecord(recordId) {
+    const res = await fetch(`${API_BASE}/grading/records/${recordId}`, {
+      method: 'DELETE',
+    });
+    return handleResponse(res);
+  },
+
+  async deleteGradingRecords(assessmentId = '') {
+    const url = assessmentId
+      ? `${API_BASE}/grading/records?assessment_id=${encodeURIComponent(assessmentId)}`
+      : `${API_BASE}/grading/records`;
+    const res = await fetch(url, {
+      method: 'DELETE',
+    });
+    return handleResponse(res);
   },
 };

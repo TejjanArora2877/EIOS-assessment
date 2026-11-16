@@ -1,7 +1,9 @@
+import os
 import uuid
+import logging
 from datetime import datetime, timezone
 from typing import List
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, UploadFile, File, status
 from backend.app.database import get_db
 from backend.app.models import (
     AssessmentCreate,
@@ -12,6 +14,9 @@ from backend.app.models import (
     AssessmentQuestionCreate,
     AssessmentQuestionResponse
 )
+from backend.app.services.assessment_parser import AssessmentDocumentParser
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/assessments", tags=["Assessments & Rubrics"])
 
@@ -426,3 +431,29 @@ def delete_assessment(assessment_id: str):
         cursor.execute("DELETE FROM assessments WHERE id = ?", (assessment_id,))
 
     return {"status": "success", "message": f"Assessment '{row['title']}' deleted successfully."}
+
+
+@router.post("/parse-document", status_code=status.HTTP_200_OK)
+async def parse_assessment_document(file: UploadFile = File(...)):
+    """
+    Parses an uploaded question paper or rubric document (.pdf, .docx, .txt, .md),
+    linearizing tables and extracting assessment title, questions, model answers,
+    and rubric criteria for teacher review before saving.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file must have a valid filename.")
+
+    _, ext = os.path.splitext(file.filename)
+    if ext.lower() not in [".pdf", ".docx", ".txt", ".md"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '{ext}'. Only PDF, DOCX, TXT, and MD files are supported."
+        )
+
+    try:
+        file_bytes = await file.read()
+        parsed_data = AssessmentDocumentParser.parse_document(file.filename, file_bytes)
+        return parsed_data
+    except Exception as e:
+        logger.exception(f"Error parsing assessment document '{file.filename}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse assessment document: {str(e)}")

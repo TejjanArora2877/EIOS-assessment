@@ -148,7 +148,17 @@ def init_db():
                 criterion_results TEXT NOT NULL,
                 evidence_citations TEXT NOT NULL,
                 provenance TEXT NOT NULL,
+                question_results TEXT,
+                overall_feedback TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (assessment_id) REFERENCES assessments (id) ON DELETE CASCADE
             );
         """)
+
+        # Ensure question_results and overall_feedback exist on grading_records
+        cursor.execute("PRAGMA table_info(grading_records);")
+        rec_cols = [row["name"] for row in cursor.fetchall()]
+        if "question_results" not in rec_cols:
+            cursor.execute("ALTER TABLE grading_records ADD COLUMN question_results TEXT;")
+        if "overall_feedback" not in rec_cols:
+            cursor.execute("ALTER TABLE grading_records ADD COLUMN overall_feedback TEXT;")

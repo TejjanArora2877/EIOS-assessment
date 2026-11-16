@@ -137,6 +137,11 @@ class QuestionGradingResult(BaseModel):
     citations: List[EvidenceCitation] = Field(default_factory=list)
 
 class GradingResponse(BaseModel):
+    id: Optional[str] = None
+    created_at: Optional[str] = None
+    submission_type: Optional[str] = None
+    submission_filename: Optional[str] = None
+    student_text: Optional[str] = None
     assessment_id: str
     assessment_title: str
     total_score: float

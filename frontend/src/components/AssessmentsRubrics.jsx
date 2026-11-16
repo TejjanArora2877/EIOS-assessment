@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 
 export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAssessment }) {
@@ -7,6 +7,11 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [successMsg, setSuccessMsg] = useState(null);
+
+  // Auto-Fill state
+  const [autofillLoading, setAutofillLoading] = useState(false);
+  const [autofillSuccess, setAutofillSuccess] = useState(null);
+  const fileInputRef = useRef(null);
 
   // Form mode: null (view list) | 'create' | 'edit'
   const [formMode, setFormMode] = useState(null);
@@ -72,6 +77,55 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
     setFormMode('create');
     setError(null);
     setSuccessMsg(null);
+    setAutofillSuccess(null);
+    setAutofillLoading(false);
+  };
+
+  const handleAutoFillUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      setAutofillLoading(true);
+      setError(null);
+      setAutofillSuccess(null);
+      const parsed = await api.parseAssessmentDocument(file);
+
+      if (parsed.title) {
+        setTitle(parsed.title);
+      }
+      if (parsed.total_marks) {
+        setTotalMarks(parsed.total_marks);
+      }
+      if (parsed.doc_scope) {
+        setDocScope(parsed.doc_scope);
+      }
+      if (parsed.questions && parsed.questions.length > 0) {
+        setQuestions(parsed.questions.map((q, idx) => ({
+          question_order: q.question_order || idx + 1,
+          question_text: q.question_text || '',
+          model_answer: q.model_answer || '',
+          criteria: (q.criteria && q.criteria.length > 0 ? q.criteria : [
+            { name: 'Core Requirement', description: 'Accurately addresses the question prompt.', max_marks: 5 }
+          ]).map(c => ({
+            name: c.name || '',
+            description: c.description || '',
+            max_marks: parseFloat(c.max_marks) || 5
+          }))
+        })));
+      }
+
+      setAutofillSuccess(
+        `Form auto-filled from "${file.name}". Review questions, linearized tables, and mark allocations before saving.`
+      );
+    } catch (err) {
+      setError(err.message || 'Failed to auto-fill from document.');
+    } finally {
+      setAutofillLoading(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
   };
 
   const openEditForm = (assessment) => {
@@ -322,6 +376,59 @@ export default function AssessmentsRubrics({ selectedAssessmentId, onSelectAsses
           <h3 className="card-title" style={{ marginBottom: '1.25rem' }}>
             {formMode === 'create' ? 'Define New Assessment & Rubric' : 'Edit Assessment & Rubric'}
           </h3>
+
+          {formMode === 'create' && (
+            <div style={{
+              background: '#f8fafc',
+              border: '1px dashed #94a3b8',
+              borderRadius: '8px',
+              padding: '1.25rem',
+              marginBottom: '1.5rem',
+              textAlign: 'center'
+            }}>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 600, color: '#334155' }}>
+                  <span>📄 Auto-Fill from Question Paper / Rubric Document</span>
+                  <span style={{ fontSize: '0.75rem', background: '#e2e8f0', color: '#475569', padding: '2px 8px', borderRadius: '4px' }}>
+                    PDF, DOCX, TXT
+                  </span>
+                </div>
+                <p style={{ margin: 0, fontSize: '0.875rem', color: '#64748b', maxWidth: '600px' }}>
+                  Upload a question paper or marking scheme to automatically extract the assessment title, questions, linearized comparison tables, and rubric criteria.
+                </p>
+                <div style={{ marginTop: '0.5rem' }}>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".pdf,.docx,.txt,.md"
+                    onChange={handleAutoFillUpload}
+                    style={{ display: 'none' }}
+                    id="autofill-file-input"
+                    disabled={autofillLoading}
+                  />
+                  <label
+                    htmlFor="autofill-file-input"
+                    className="btn btn-secondary"
+                    style={{ cursor: autofillLoading ? 'wait' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}
+                  >
+                    {autofillLoading ? (
+                      <>
+                        <span className="spinner" style={{ width: '14px', height: '14px', borderWidth: '2px' }}></span>
+                        Extracting questions, tables, and rubrics...
+                      </>
+                    ) : (
+                      'Choose PDF / DOCX / TXT File'
+                    )}
+                  </label>
+                </div>
+                {autofillSuccess && (
+                  <div className="alert alert-success" style={{ marginTop: '0.75rem', width: '100%', textAlign: 'left', marginBottom: 0 }}>
+                    {autofillSuccess}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
           <form onSubmit={handleSubmit}>
             <div className="form-group">

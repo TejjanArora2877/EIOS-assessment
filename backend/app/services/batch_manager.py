@@ -33,7 +33,12 @@ def _save_grading_record(res: GradingResponse, student_text: str, sub_type: str,
     """Persists an individual graded submission to the database for auditing and history."""
     import json
     now_iso = datetime.now(timezone.utc).isoformat()
-    record_id = str(uuid.uuid4())
+    record_id = res.id or str(uuid.uuid4())
+    res.id = record_id
+    res.created_at = now_iso
+    res.submission_type = sub_type
+    res.submission_filename = sub_filename
+    res.student_text = student_text
     t0 = time.perf_counter()
     try:
         with get_db() as conn:
@@ -42,8 +47,9 @@ def _save_grading_record(res: GradingResponse, student_text: str, sub_type: str,
                     id, assessment_id, submission_type, submission_filename,
                     student_text, total_score, max_score, percentage,
                     requires_teacher_review, review_reasons,
-                    criterion_results, evidence_citations, provenance, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    criterion_results, evidence_citations, provenance,
+                    question_results, overall_feedback, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record_id,
                 res.assessment_id,
@@ -58,6 +64,8 @@ def _save_grading_record(res: GradingResponse, student_text: str, sub_type: str,
                 json.dumps([c.model_dump() for c in res.criterion_breakdown]),
                 json.dumps([cit.model_dump() for cit in res.citations]),
                 json.dumps(res.provenance),
+                json.dumps([q.model_dump() for q in res.question_results]) if res.question_results else None,
+                res.overall_feedback or "",
                 now_iso
             ))
         save_ms = (time.perf_counter() - t0) * 1000

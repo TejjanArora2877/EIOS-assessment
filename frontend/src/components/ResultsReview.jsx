@@ -1,4 +1,11 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
+import { api } from '../api';
+
+function getScoreColor(pct) {
+  if (pct >= 80) return 'var(--success)';
+  if (pct >= 50) return 'var(--warning)';
+  return 'var(--danger)';
+}
 
 function CriterionCard({ crit, getScoreColor }) {
   const critPct = crit.max_marks > 0 ? (crit.awarded_marks / crit.max_marks) * 100 : 0;
@@ -98,17 +105,264 @@ function CriterionCard({ crit, getScoreColor }) {
 }
 
 export default function ResultsReview({ result, onNewEvaluation }) {
-  if (!result) {
-    return (
-      <div className="card">
-        <h2 className="card-title">Results & Review</h2>
-        <div className="empty-state">
-          <div className="empty-state-icon">📊</div>
-          <h3 className="empty-state-title">No grading results to display</h3>
-          <p className="empty-state-text">
-            Submit a student response in Section 3 to view the objective criterion breakdown, citations, and LLM feedback.
+  const [activeResult, setActiveResult] = useState(result);
+  const [records, setRecords] = useState([]);
+  const [assessments, setAssessments] = useState([]);
+  const [selectedAssessmentFilter, setSelectedAssessmentFilter] = useState('');
+  const [loadingRecords, setLoadingRecords] = useState(false);
+  const [recordsError, setRecordsError] = useState(null);
+
+  // Synchronize activeResult when parent provides a new result
+  useEffect(() => {
+    setActiveResult(result);
+  }, [result]);
+
+  const loadAssessments = async () => {
+    try {
+      const data = await api.getAssessments();
+      setAssessments(data.assessments || []);
+    } catch (err) {
+      console.error('Failed to load assessments for filter:', err);
+    }
+  };
+
+  const loadRecords = async (assessmentId = selectedAssessmentFilter) => {
+    setLoadingRecords(true);
+    setRecordsError(null);
+    try {
+      const data = await api.fetchGradingRecords(assessmentId);
+      setRecords(data || []);
+    } catch (err) {
+      console.error('Failed to fetch grading records:', err);
+      setRecordsError(err.message || 'Failed to load historical grading records.');
+    } finally {
+      setLoadingRecords(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAssessments();
+  }, []);
+
+  useEffect(() => {
+    loadRecords(selectedAssessmentFilter);
+  }, [selectedAssessmentFilter]);
+
+  const renderPreviousResultsSection = () => (
+    <div className="card" style={{ padding: '1.25rem 1.5rem', marginBottom: '1.25rem' }}>
+      <div className="flex-between" style={{ alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+          <h3 className="card-title" style={{ fontSize: '1.2rem', margin: 0 }}>
+            Previous Assessment Results
+          </h3>
+          <span className="badge badge-neutral" style={{ fontSize: '0.75rem' }}>
+            {records.length} {records.length === 1 ? 'Record' : 'Records'}
+          </span>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+          <select
+            className="form-control"
+            style={{ width: 'auto', minWidth: '220px', padding: '0.35rem 0.65rem', fontSize: '0.85rem' }}
+            value={selectedAssessmentFilter}
+            onChange={(e) => setSelectedAssessmentFilter(e.target.value)}
+          >
+            <option value="">All Stored Assessments</option>
+            {assessments.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.title}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => loadRecords(selectedAssessmentFilter)}
+            disabled={loadingRecords}
+            title="Refresh previous records"
+          >
+            {loadingRecords ? 'Refreshing...' : '🔄 Refresh'}
+          </button>
+          <button
+            className="btn btn-danger btn-sm"
+            onClick={async () => {
+              const targetDesc = selectedAssessmentFilter
+                ? 'all grading records for the selected assessment'
+                : 'ALL stored grading records';
+              const confirmed = window.confirm(
+                `Are you sure you want to permanently delete ${targetDesc}? This action cannot be undone.`
+              );
+              if (!confirmed) return;
+              try {
+                await api.deleteGradingRecords(selectedAssessmentFilter);
+                if (activeResult && (!selectedAssessmentFilter || activeResult.assessment_id === selectedAssessmentFilter)) {
+                  setActiveResult(null);
+                }
+                await loadRecords(selectedAssessmentFilter);
+              } catch (err) {
+                console.error('Failed to delete grading records:', err);
+                setRecordsError(err.message || 'Failed to delete grading records.');
+              }
+            }}
+            disabled={loadingRecords || records.length === 0}
+            title={selectedAssessmentFilter ? "Delete all records for selected assessment" : "Delete all stored records"}
+          >
+            {selectedAssessmentFilter ? '🗑️ Delete Filtered' : '🗑️ Clear All'}
+          </button>
+        </div>
+      </div>
+
+      {recordsError && (
+        <div className="alert alert-danger" style={{ marginBottom: '1rem', fontSize: '0.85rem' }}>
+          {recordsError}
+        </div>
+      )}
+
+      {loadingRecords ? (
+        <div style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-muted)' }}>
+          Loading historical grading records...
+        </div>
+      ) : records.length === 0 ? (
+        <div className="empty-state" style={{ padding: '1.5rem' }}>
+          <p className="empty-state-text" style={{ margin: 0 }}>
+            No historical grading records found in SQLite for this filter.
           </p>
         </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table className="table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
+            <thead>
+              <tr style={{ borderBottom: '2px solid var(--border)', textAlign: 'left', color: 'var(--text-secondary)' }}>
+                <th style={{ padding: '0.65rem 0.75rem' }}>Submission / File</th>
+                <th style={{ padding: '0.65rem 0.75rem' }}>Assessment</th>
+                <th style={{ padding: '0.65rem 0.75rem' }}>Score</th>
+                <th style={{ padding: '0.65rem 0.75rem' }}>Status</th>
+                <th style={{ padding: '0.65rem 0.75rem' }}>Date / Time</th>
+                <th style={{ padding: '0.65rem 0.75rem', textAlign: 'right' }}>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {records.map((rec) => {
+                const recPct = rec.max_score > 0 ? (rec.total_score / rec.max_score) * 100 : 0;
+                const isSelected = activeResult?.id === rec.id;
+
+                return (
+                  <tr
+                    key={rec.id}
+                    style={{
+                      borderBottom: '1px solid var(--border)',
+                      backgroundColor: isSelected ? 'rgba(79, 70, 229, 0.05)' : 'transparent',
+                      transition: 'background-color 0.15s ease'
+                    }}
+                  >
+                    <td style={{ padding: '0.65rem 0.75rem', fontWeight: 600 }}>
+                      📄 {rec.submission_filename || (rec.submission_type === 'text' ? 'Pasted Text' : 'File Upload')}
+                    </td>
+                    <td style={{ padding: '0.65rem 0.75rem', color: 'var(--text-secondary)' }}>
+                      {rec.assessment_title}
+                    </td>
+                    <td style={{ padding: '0.65rem 0.75rem', fontWeight: 700, color: getScoreColor(recPct) }}>
+                      {rec.total_score.toFixed(2)} / {rec.max_score.toFixed(2)} ({recPct.toFixed(1)}%)
+                    </td>
+                    <td style={{ padding: '0.65rem 0.75rem' }}>
+                      {rec.requires_teacher_review ? (
+                        <span className="badge badge-warning" style={{ fontSize: '0.75rem' }}>⚠️ Needs Review</span>
+                      ) : (
+                        <span className="badge badge-success" style={{ fontSize: '0.75rem' }}>✓ Verified</span>
+                      )}
+                    </td>
+                    <td style={{ padding: '0.65rem 0.75rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                      {rec.created_at ? new Date(rec.created_at).toLocaleString() : 'N/A'}
+                    </td>
+                    <td style={{ padding: '0.65rem 0.75rem', textAlign: 'right' }}>
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        style={{
+                          backgroundColor: isSelected ? 'var(--primary)' : undefined,
+                          color: isSelected ? '#ffffff' : undefined,
+                          padding: '0.25rem 0.65rem',
+                          fontSize: '0.8rem'
+                        }}
+                        onClick={() => {
+                          setActiveResult(rec);
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                      >
+                        {isSelected ? 'Viewing' : 'View Breakdown'}
+                      </button>
+                      <button
+                        className="btn btn-danger btn-sm"
+                        style={{
+                          padding: '0.25rem 0.65rem',
+                          fontSize: '0.8rem',
+                          marginLeft: '0.4rem'
+                        }}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          const filenameOrType = rec.submission_filename || (rec.submission_type === 'text' ? 'Pasted Text' : 'File');
+                          const confirmed = window.confirm(
+                            `Are you sure you want to delete the grading record for "${filenameOrType}"?`
+                          );
+                          if (!confirmed) return;
+                          try {
+                            await api.deleteGradingRecord(rec.id);
+                            if (activeResult?.id === rec.id) {
+                              setActiveResult(null);
+                            }
+                            await loadRecords(selectedAssessmentFilter);
+                          } catch (err) {
+                            console.error('Failed to delete record:', err);
+                            setRecordsError(err.message || 'Failed to delete record.');
+                          }
+                        }}
+                        title="Delete this record"
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+
+  // If there is no active result selected, render historical records or empty state
+  if (!activeResult) {
+    return (
+      <div className="results-container">
+        {records.length > 0 ? (
+          <div>
+            <div className="card" style={{ padding: '1.25rem 1.5rem', marginBottom: '1.25rem' }}>
+              <div className="flex-between" style={{ alignItems: 'center' }}>
+                <div>
+                  <h2 className="card-title" style={{ fontSize: '1.4rem', margin: 0 }}>Results &amp; Review</h2>
+                  <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginTop: '0.25rem', marginBottom: 0 }}>
+                    Select a previous evaluation below to view its complete breakdown, or grade a new answer in Section 3.
+                  </p>
+                </div>
+                <button className="btn btn-primary btn-sm" onClick={onNewEvaluation}>
+                  Grade New Submission
+                </button>
+              </div>
+            </div>
+            {renderPreviousResultsSection()}
+          </div>
+        ) : (
+          <div className="card">
+            <h2 className="card-title">Results &amp; Review</h2>
+            <div className="empty-state">
+              <div className="empty-state-icon">📊</div>
+              <h3 className="empty-state-title">No grading results to display</h3>
+              <p className="empty-state-text">
+                Submit a student response in Section 3 to view the objective criterion breakdown, citations, and LLM feedback.
+              </p>
+            </div>
+            {renderPreviousResultsSection()}
+          </div>
+        )}
       </div>
     );
   }
@@ -124,17 +378,17 @@ export default function ResultsReview({ result, onNewEvaluation }) {
     review_reasons,
     citations,
     provenance,
-    question_results
-  } = result;
-
-  const getScoreColor = (pct) => {
-    if (pct >= 80) return 'var(--success)';
-    if (pct >= 50) return 'var(--warning)';
-    return 'var(--danger)';
-  };
+    question_results,
+    submission_type,
+    submission_filename,
+    created_at
+  } = activeResult;
 
   const isLowScoreOrIrrelevant = total_score === 0 || percentage < 30;
   const hasMultipleQuestions = question_results && question_results.length > 1;
+
+  const displaySubType = submission_type || provenance?.submission_type || 'text';
+  const displayFilename = submission_filename || provenance?.submission_filename;
 
   return (
     <div className="results-container">
@@ -149,9 +403,10 @@ export default function ResultsReview({ result, onNewEvaluation }) {
               {assessment_title}
             </h2>
             <div style={{ fontSize: '0.825rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-              Evaluated via EIOS RAG Engine • Submission Type: <strong>{provenance?.submission_type || 'text'}</strong>
-              {provenance?.submission_filename ? ` (${provenance.submission_filename})` : ''}
+              Evaluated via EIOS RAG Engine • Submission Type: <strong>{displaySubType}</strong>
+              {displayFilename ? ` (${displayFilename})` : ''}
               {hasMultipleQuestions && ` • ${question_results.length} Questions`}
+              {created_at && ` • Evaluated: ${new Date(created_at).toLocaleString()}`}
             </div>
           </div>
 
@@ -280,7 +535,7 @@ export default function ResultsReview({ result, onNewEvaluation }) {
           <div className="flex-between" style={{ marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
             <div>
               <h3 className="card-title" style={{ fontSize: '1.2rem' }}>
-                Criterion-Wise Evaluation Breakdown ({criterion_breakdown.length})
+                Criterion-Wise Evaluation Breakdown ({criterion_breakdown ? criterion_breakdown.length : 0})
               </h3>
               <p className="card-description" style={{ marginBottom: 0, fontSize: '0.825rem' }}>
                 Transparent, objective assessment per rubric requirement.
@@ -289,7 +544,7 @@ export default function ResultsReview({ result, onNewEvaluation }) {
           </div>
 
           <div className="criteria-results-grid">
-            {criterion_breakdown.map((crit, idx) => (
+            {(criterion_breakdown || []).map((crit, idx) => (
               <CriterionCard key={idx} crit={crit} getScoreColor={getScoreColor} />
             ))}
           </div>
@@ -399,6 +654,9 @@ export default function ResultsReview({ result, onNewEvaluation }) {
           )}
         </div>
       </details>
+
+      {/* Previous Assessment Results (Persistent History) */}
+      {renderPreviousResultsSection()}
     </div>
   );
 }

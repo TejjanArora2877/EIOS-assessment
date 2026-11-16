@@ -24,6 +24,7 @@ from backend.app.services.vector_store import VectorStore
 from backend.app.services.retriever import HybridRetriever
 from backend.app.services.llm_feedback import LLMFeedbackService
 from backend.app.services.answer_segmenter import AnswerSegmenter
+from backend.app.services.table_linearizer import TableLinearizer
 
 class GradingEngine:
     @staticmethod
@@ -126,6 +127,11 @@ class GradingEngine:
         and NLI validation.
         """
         s = text.strip()
+        # Linearized table propositions ("For X Y, Z is W.") are already declarative
+        if re.match(r'(?i)^For\s+[A-Za-z0-9_ -]+,\s+', s):
+            clean_s = s.rstrip(' ;,')
+            return clean_s if clean_s.endswith('.') else clean_s + '.'
+
         # 1. Strip inline administrative / marking instructions
         s = re.sub(r'(?i)[;,]\s*(?:award|deduct)\s+(?:partial\s+|full\s+)?(?:marks?|points?|credit).*$', '', s)
         s = re.sub(r'(?i)\s*\((?:award|deduct|partial\s+marks?|marks?\s+are).*?\)', '', s)
@@ -246,6 +252,7 @@ class GradingEngine:
         Filters administrative grading instructions and normalizes instructional language.
         Splits compound clauses on coordinating predicate verbs into atomic propositions.
         """
+        criterion_description = TableLinearizer.linearize_markdown_tables(criterion_description or "")
         raw_sents = cls._split_sentences(criterion_description)
         substantive = [s for s in raw_sents if not cls._is_administrative_sentence(s)]
 
@@ -443,6 +450,94 @@ class GradingEngine:
             return True
         return False
 
+    HEADER_NOUNS = {
+        'type', 'name', 'mode', 'platform', 'method', 'tool', 'system',
+        'format', 'class', 'category', 'level', 'phase', 'stage', 'layer',
+        'protocol', 'artifact', 'technique', 'algorithm', 'metric',
+        'component', 'property', 'attribute', 'item', 'field'
+    }
+
+    @classmethod
+    def _extract_linearized_subject(
+        cls,
+        text: str,
+        known_headers: Optional[Set[str]] = None
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Matches linearized table sentences following:
+        ^For <Header> <Entity>, <Col2> is <Val2>...
+        Returns (normalized_header, normalized_entity) if matched, else None.
+        """
+        if not text:
+            return None
+        clean_text = text.strip()
+        m = re.match(r'(?i)^For\s+([^,]+),\s*(.+)$', clean_text)
+        if not m:
+            return None
+
+        h0_v0 = m.group(1).strip()
+        words = h0_v0.split()
+        if len(words) < 2:
+            return None
+
+        # 1. Check known headers first if available
+        if known_headers:
+            for kh in sorted(known_headers, key=len, reverse=True):
+                kh_norm = kh.strip().lower()
+                if h0_v0.lower().startswith(kh_norm + ' '):
+                    ent = h0_v0[len(kh_norm):].strip().lower()
+                    if ent:
+                        return (kh_norm, ent)
+
+        # 2. Check if any word in the first 1-3 words is a known header noun
+        for idx in range(min(3, len(words) - 1)):
+            if words[idx].lower() in cls.HEADER_NOUNS:
+                header = ' '.join(words[:idx + 1]).lower()
+                entity = ' '.join(words[idx + 1:]).lower()
+                if header and entity:
+                    return (header, entity)
+
+        # 3. Structural regex match fallback
+        rx = re.match(
+            r'(?i)^For\s+([A-Za-z0-9_ -]+?)\s+([A-Za-z0-9_./()-]+(?:\s+[A-Za-z0-9_./()-]+){0,4}),\s+',
+            clean_text
+        )
+        if rx:
+            h = rx.group(1).strip().lower()
+            e = rx.group(2).strip().lower()
+            if h and e:
+                return (h, e)
+
+        return None
+
+    @classmethod
+    def _is_sibling_table_entity_candidate(
+        cls,
+        cand_text: str,
+        prop_entity: str,
+        all_table_entities: Set[str]
+    ) -> bool:
+        """
+        Returns True if cand_text explicitly describes a different table row's entity
+        and does NOT mention prop_entity.
+        """
+        cand_lower = cand_text.lower()
+        prop_ent_lower = prop_entity.lower()
+
+        # Check if prop_entity (or singular/plural) appears in cand_text
+        prop_stems = {prop_ent_lower, prop_ent_lower.rstrip('s'), prop_ent_lower + 's'}
+        if any(stem in cand_lower for stem in prop_stems if len(stem) > 2):
+            return False
+
+        # Check if at least one sibling entity from all_table_entities - {prop_entity} appears in cand_text
+        sibling_entities = {e.lower() for e in all_table_entities} - {prop_ent_lower}
+        for sib in sibling_entities:
+            sib_stems = {sib, sib.rstrip('s'), sib + 's'}
+            if any(stem in cand_lower for stem in sib_stems if len(stem) > 2):
+                return True
+
+        return False
+
     @classmethod
     def _extract_criterion_excerpts(
         cls,
@@ -621,7 +716,21 @@ class GradingEngine:
         fwd_pairs_to_batch: List[Tuple[str, str]] = []
         prop_precomputed: List[Dict[str, Any]] = []
 
+        # Collect linearized table subject entities across this criterion and all assessment propositions
+        candidate_table_props = list(target_propositions)
+        if all_assessment_props:
+            candidate_table_props.extend(all_assessment_props)
+
+        all_table_entities: Set[str] = set()
+        known_table_headers: Set[str] = set()
+        for p_str in candidate_table_props:
+            extracted_subj = cls._extract_linearized_subject(p_str)
+            if extracted_subj:
+                known_table_headers.add(extracted_subj[0])
+                all_table_entities.add(extracted_subj[1])
+
         for prop_idx, prop in enumerate(target_propositions):
+            prop_subj = cls._extract_linearized_subject(prop, known_table_headers)
             prop_emb = target_prop_embs[prop_idx] if target_prop_embs is not None else ModelsLoader.encode_texts([prop])[0]
             sims = cosine_similarity([prop_emb], cand_embs)[0]
             best_idx = int(sims.argmax())
@@ -714,15 +823,33 @@ class GradingEngine:
                 if not cls._is_conceptually_related(s_text, prop, s_sim, distinctive_prop_tokens, prop_tokens):
                     continue
 
+                # Linearized Table Subject-Entity Isolation Guard
+                if prop_subj is not None:
+                    s_subj = cls._extract_linearized_subject(s_text, known_table_headers)
+                    if s_subj is not None:
+                        if s_subj[0] == prop_subj[0] and s_subj[1] != prop_subj[1]:
+                            continue
+                    elif cls._is_sibling_table_entity_candidate(s_text, prop_subj[1], all_table_entities):
+                        continue
+
                 s_emb = cand_embs[s_idx] if s_idx < len(cand_embs) else ModelsLoader.encode_texts([s_text])[0]
 
                 # Intra-Criterion Cross-Proposition Affinity Guard (Rule 2B):
                 # If candidate is more similar to a sibling proposition within the same criterion,
-                # only skip if candidate has no lexical overlap with this proposition and is significantly more similar to the sibling
+                # skip if candidate has no exclusive lexical overlap with this proposition and is more similar to the sibling
                 if sibling_prop_embs is not None and len(sibling_prop_embs) > 0:
                     other_prop_sims = cosine_similarity([s_emb], sibling_prop_embs)[0]
-                    if len(other_prop_sims) > 0 and not has_prop_overlap and float(other_prop_sims.max()) > s_sim + 0.12:
-                        continue
+                    if len(other_prop_sims) > 0:
+                        max_sib_sim = float(other_prop_sims.max())
+                        sib_tokens = set().union(*(cls._extract_content_tokens(sib) for sib in sibling_props)) if sibling_props else set()
+                        exclusive_dist_prop_toks = (distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens) - sib_tokens
+                        has_exclusive_dist_overlap = bool(s_tokens & exclusive_dist_prop_toks) if exclusive_dist_prop_toks else has_prop_overlap
+                        sib_dist_tokens = sib_tokens - q_tokens - prop_tokens
+                        has_sib_exclusive_overlap = bool(s_tokens & sib_dist_tokens) if sib_dist_tokens else False
+                        if not has_exclusive_dist_overlap and (max_sib_sim > s_sim or has_sib_exclusive_overlap):
+                            continue
+                        if not has_prop_overlap and max_sib_sim > s_sim + 0.08:
+                            continue
 
                 # Cross-criterion isolation
                 if not bool(re.search(neg_regex, s_text)) and all_criteria_descriptions:
@@ -782,7 +909,8 @@ class GradingEngine:
                 "unique_contra_candidates": unique_contra_candidates,
                 "prop_other_embs": prop_other_embs,
                 "sibling_prop_embs": sibling_prop_embs,
-                "sibling_props": sibling_props
+                "sibling_props": sibling_props,
+                "prop_subj": prop_subj
             })
 
         # ONE batch call for all forward pairs across the entire criterion
@@ -872,6 +1000,7 @@ class GradingEngine:
 
         for meta in prop_precomputed:
             prop = meta["prop"]
+            prop_subj = meta.get("prop_subj")
             prop_emb = meta["prop_emb"]
             sims = meta["sims"]
             best_idx = meta["best_idx"]
@@ -982,54 +1111,72 @@ class GradingEngine:
             if is_concept_grounded and (ent_score >= 0.55 or best_fwd_ent >= 0.65):
                 verify_cand = best_ent_cand or best_cand
                 if verify_cand:
-                    rev_check = ModelsLoader.predict_nli([(prop, verify_cand)])[0]
-                    if rev_check["contradiction"] >= 0.60 and rev_check["contradiction"] > rev_check["entailment"]:
-                        cand_fwd_r = cand_prop_nli.get(best_ent_cand_idx) if best_ent_cand_idx is not None else None
-                        if cand_fwd_r is None:
-                            cand_fwd_r = ModelsLoader.predict_nli([(verify_cand, prop)])[0]
-                        cand_fwd_ent = cand_fwd_r["entailment"]
-                        cand_fwd_contra = cand_fwd_r["contradiction"]
+                    # Linearized Table Subject-Entity Isolation Guard
+                    is_sibling_table_cand = False
+                    if prop_subj is not None:
+                        v_subj = cls._extract_linearized_subject(verify_cand, known_table_headers)
+                        if v_subj is not None:
+                            if v_subj[0] == prop_subj[0] and v_subj[1] != prop_subj[1]:
+                                is_sibling_table_cand = True
+                        elif cls._is_sibling_table_entity_candidate(verify_cand, prop_subj[1], all_table_entities):
+                            is_sibling_table_cand = True
 
-                        # Guard A: Conditional / Contrapositive Framing Guard
-                        has_conditional = bool(re.search(r'(?i)\b(without|unless|absent|if\s+not)\b', verify_cand))
-                        dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
-                        v_tokens = cls._extract_content_tokens(verify_cand)
-                        base_dist_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in (v_tokens & dist_prop_toks)}
-                        is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and cand_fwd_contra < 0.35
-
-                        # Guard B: Multi-Clause Contrastive Proposition Guard
-                        contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
-                        is_contrast_subclause_entailed = False
-                        if len(contrast_clauses) >= 2:
-                            for cl in contrast_clauses:
-                                cl_r = ModelsLoader._nli_cache.get((verify_cand, cl))
-                                if cl_r is None:
-                                    cl_r = ModelsLoader.predict_nli([(verify_cand, cl)])[0]
-                                if cl_r["entailment"] >= 0.60 and cl_r["entailment"] > cl_r["contradiction"]:
-                                    is_contrast_subclause_entailed = True
-                                    break
-
-                        # Reverse NLI Elaboration Guard (Rule 2C):
-                        # If forward NLI is already strongly entailed (best_fwd_ent >= 0.62)
-                        # and candidate does not contain explicit polarity-inverting qualifiers,
-                        # treat as a valid detailed elaboration (do NOT override with contradiction).
-                        has_polarity_inversion = bool(re.search(
-                            r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|ignore|reject|pull[\s-]+power|unplug)\b',
-                            verify_cand
-                        ))
-                        if is_contrapositive:
-                            has_polarity_inversion = False
-
-                        if is_contrapositive or is_contrast_subclause_entailed or ((best_fwd_ent >= 0.62 or cand_fwd_ent >= 0.62 or ent_score >= 0.62) and cand_fwd_contra < 0.25 and not has_polarity_inversion):
-                            is_prop_demonstrated = True
-                        else:
-                            is_contradiction = True
-                            cand = verify_cand
-                            contradictions_found.append(
-                                f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
-                            )
+                    if is_sibling_table_cand:
+                        is_prop_demonstrated = (best_fwd_ent >= 0.50 or ent_score >= 0.50)
                     else:
-                        is_prop_demonstrated = True
+                        v_tokens = cls._extract_content_tokens(verify_cand)
+                        sib_tokens = set().union(*(cls._extract_content_tokens(sib) for sib in sibling_props)) if sibling_props else set()
+                        p_exclusive = (distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens) - sib_tokens
+                        sib_exclusive = sib_tokens - q_tokens - prop_tokens
+                        is_swapped_entity = bool(v_tokens & sib_exclusive) and not bool(v_tokens & p_exclusive) if (sib_exclusive and p_exclusive) else False
+
+                        rev_check = ModelsLoader.predict_nli([(prop, verify_cand)])[0]
+                        if (rev_check["contradiction"] >= 0.60 or (is_swapped_entity and rev_check["contradiction"] >= 0.40)) and rev_check["contradiction"] > rev_check["entailment"]:
+                            cand_fwd_r = cand_prop_nli.get(best_ent_cand_idx) if best_ent_cand_idx is not None else None
+                            if cand_fwd_r is None:
+                                cand_fwd_r = ModelsLoader.predict_nli([(verify_cand, prop)])[0]
+                            cand_fwd_ent = cand_fwd_r["entailment"]
+                            cand_fwd_contra = cand_fwd_r["contradiction"]
+
+                            # Guard A: Conditional / Contrapositive Framing Guard
+                            has_conditional = bool(re.search(r'(?i)\b(without|unless|absent|if\s+not)\b', verify_cand))
+                            dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
+                            base_dist_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in (v_tokens & dist_prop_toks)}
+                            is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and cand_fwd_contra < 0.35
+
+                            # Guard B: Multi-Clause Contrastive Proposition Guard
+                            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+                            is_contrast_subclause_entailed = False
+                            if len(contrast_clauses) >= 2:
+                                for cl in contrast_clauses:
+                                    cl_r = ModelsLoader._nli_cache.get((verify_cand, cl))
+                                    if cl_r is None:
+                                        cl_r = ModelsLoader.predict_nli([(verify_cand, cl)])[0]
+                                    if cl_r["entailment"] >= 0.60 and cl_r["entailment"] > cl_r["contradiction"]:
+                                        is_contrast_subclause_entailed = True
+                                        break
+
+                            # Reverse NLI Elaboration Guard (Rule 2C):
+                            # If forward NLI is already strongly entailed (best_fwd_ent >= 0.62)
+                            # and candidate does not contain explicit polarity-inverting qualifiers or swapped sibling entities,
+                            # treat as a valid detailed elaboration (do NOT override with contradiction).
+                            has_polarity_inversion = bool(re.search(
+                                r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|ignore|reject|pull[\s-]+power|unplug)\b',
+                                verify_cand
+                            )) or is_swapped_entity
+                            if is_contrapositive:
+                                has_polarity_inversion = False
+
+                            if is_contrapositive or is_contrast_subclause_entailed or ((best_fwd_ent >= 0.62 or cand_fwd_ent >= 0.62 or ent_score >= 0.62) and cand_fwd_contra < 0.25 and not has_polarity_inversion):
+                                is_prop_demonstrated = True
+                            else:
+                                is_contradiction = True
+                                cand = verify_cand
+                                contradictions_found.append(
+                                    f"Student stated '{cand[:80]}...' which contradicts expected concept '{prop}'"
+                                )
+                        else:
+                            is_prop_demonstrated = True
                 else:
                     is_prop_demonstrated = True
             neg_regex = r'(?i)\b(never|not|no|neither|nor|cannot|can\'t|won\'t|doesn\'t|don\'t|discards?|avoids?|rejects?|fails?|false|incorrect|incompatible|inefficient|unnecessary|unneeded|pointless|interchangeable|same\s+thing)\b'
@@ -1046,6 +1193,15 @@ class GradingEngine:
                     if not cls._is_conceptually_related(c_text, prop, c_sim, distinctive_prop_tokens, prop_tokens):
                         continue
 
+                    # Linearized Table Subject-Entity Isolation Guard
+                    if prop_subj is not None:
+                        c_subj = cls._extract_linearized_subject(c_text, known_table_headers)
+                        if c_subj is not None:
+                            if c_subj[0] == prop_subj[0] and c_subj[1] != prop_subj[1]:
+                                continue
+                        elif cls._is_sibling_table_entity_candidate(c_text, prop_subj[1], all_table_entities):
+                            continue
+
                     # Intra-Criterion Cross-Proposition Affinity Guard (Rule 2B)
                     c_tokens = cls._extract_content_tokens(c_text)
                     c_has_overlap = bool(c_tokens & (prop_tokens | distinctive_prop_tokens))
@@ -1054,8 +1210,17 @@ class GradingEngine:
                         if c_sim is None:
                             c_sim = float(cosine_similarity([c_emb], [prop_emb])[0][0])
                         other_prop_sims = cosine_similarity([c_emb], sibling_prop_embs)[0]
-                        if len(other_prop_sims) > 0 and not c_has_overlap and float(other_prop_sims.max()) > c_sim + 0.12:
-                            continue
+                        if len(other_prop_sims) > 0:
+                            max_sib_sim = float(other_prop_sims.max())
+                            sib_tokens = set().union(*(cls._extract_content_tokens(sib) for sib in sibling_props)) if sibling_props else set()
+                            exclusive_dist_prop_toks = (distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens) - sib_tokens
+                            has_exclusive_dist_overlap = bool(c_tokens & exclusive_dist_prop_toks) if exclusive_dist_prop_toks else c_has_overlap
+                            sib_dist_tokens = sib_tokens - q_tokens - prop_tokens
+                            has_sib_exclusive_overlap = bool(c_tokens & sib_dist_tokens) if sib_dist_tokens else False
+                            if not has_exclusive_dist_overlap and (max_sib_sim > c_sim or has_sib_exclusive_overlap):
+                                continue
+                            if not c_has_overlap and max_sib_sim > c_sim + 0.08:
+                                continue
 
                     is_explicit_neg = bool(re.search(neg_regex, c_text))
 
@@ -1518,6 +1683,8 @@ class GradingEngine:
         """
         Main grading pipeline for both pasted text and file uploads.
         """
+        student_text = TableLinearizer.linearize_markdown_tables(student_text or "")
+
         # Multi-question assessment check: auto-delegate if multiple questions exist
         if hasattr(assessment, "questions") and assessment.questions and len(assessment.questions) > 1:
             return cls.grade_multi_question_submission(
@@ -1807,6 +1974,7 @@ class GradingEngine:
         in complete isolation, eliminating cross-question contradiction interference and
         scoping evidence retrieval.
         """
+        student_text = TableLinearizer.linearize_markdown_tables(student_text or "")
         t_overall_start = time.perf_counter()
 
         effective_feedback_mode = (feedback_mode or settings.FEEDBACK_MODE).lower()

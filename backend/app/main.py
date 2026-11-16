@@ -39,7 +39,9 @@ from backend.app.routers import health, documents, assessments, grading
 app.include_router(health.router)
 app.include_router(documents.router)
 app.include_router(assessments.router)
+app.include_router(assessments.router, prefix="/api")
 app.include_router(grading.router)
+app.include_router(grading.router, prefix="/api")
 
 @app.get("/")
 def root():
