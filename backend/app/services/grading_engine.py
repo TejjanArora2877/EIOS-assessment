@@ -470,7 +470,7 @@ class GradingEngine:
         """
         if not text:
             return None
-        clean_text = text.strip()
+        clean_text = re.sub(r'^[\s\W_]+', '', text or '').strip()
         m = re.match(r'(?i)^For\s+([^,]+),\s*(.+)$', clean_text)
         if not m:
             return None

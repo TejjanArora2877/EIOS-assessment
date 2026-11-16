@@ -147,6 +147,7 @@ class AnswerSegmenter:
             content_start = m["end"]
             content_end = matches[i + 1]["start"] if i + 1 < len(matches) else len(text)
             chunk = text[content_start:content_end].strip()
+            chunk = re.sub(r'^[\s:\-\)\.]+', '', chunk).strip()
 
             if qid in slices and slices[qid]:
                 slices[qid] = f"{slices[qid]}\n\n{chunk}"
@@ -231,5 +232,6 @@ class AnswerSegmenter:
         final_slices: Dict[str, str] = {}
         for idx, q in enumerate(questions):
             qid = _get_qid(q, idx)
-            final_slices[qid] = (slices.get(qid) or "").strip()
+            raw = (slices.get(qid) or "").strip()
+            final_slices[qid] = re.sub(r'^[\s:\-\)\.]+', '', raw).strip()
         return final_slices

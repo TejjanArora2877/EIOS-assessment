@@ -107,6 +107,7 @@ function CriterionCard({ crit, getScoreColor }) {
 export default function ResultsReview({ result, onNewEvaluation }) {
   const [activeResult, setActiveResult] = useState(result);
   const [records, setRecords] = useState([]);
+  const [selectedRecordIds, setSelectedRecordIds] = useState([]);
   const [assessments, setAssessments] = useState([]);
   const [selectedAssessmentFilter, setSelectedAssessmentFilter] = useState('');
   const [loadingRecords, setLoadingRecords] = useState(false);
@@ -129,6 +130,7 @@ export default function ResultsReview({ result, onNewEvaluation }) {
   const loadRecords = async (assessmentId = selectedAssessmentFilter) => {
     setLoadingRecords(true);
     setRecordsError(null);
+    setSelectedRecordIds([]);
     try {
       const data = await api.fetchGradingRecords(assessmentId);
       setRecords(data || []);
@@ -147,6 +149,20 @@ export default function ResultsReview({ result, onNewEvaluation }) {
   useEffect(() => {
     loadRecords(selectedAssessmentFilter);
   }, [selectedAssessmentFilter]);
+
+  const handleToggleSelectAll = () => {
+    if (selectedRecordIds.length === records.length && records.length > 0) {
+      setSelectedRecordIds([]);
+    } else {
+      setSelectedRecordIds(records.map((r) => r.id));
+    }
+  };
+
+  const handleToggleSelectRecord = (id) => {
+    setSelectedRecordIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
 
   const renderPreviousResultsSection = () => (
     <div className="card" style={{ padding: '1.25rem 1.5rem', marginBottom: '1.25rem' }}>
@@ -182,6 +198,33 @@ export default function ResultsReview({ result, onNewEvaluation }) {
           >
             {loadingRecords ? 'Refreshing...' : '🔄 Refresh'}
           </button>
+          {selectedRecordIds.length > 0 && (
+            <button
+              className="btn btn-danger btn-sm"
+              onClick={async () => {
+                const count = selectedRecordIds.length;
+                const confirmed = window.confirm(
+                  `Are you sure you want to permanently delete the ${count} selected grading ${count === 1 ? 'record' : 'records'}?`
+                );
+                if (!confirmed) return;
+                try {
+                  await api.deleteSelectedGradingRecords(selectedRecordIds);
+                  if (activeResult && selectedRecordIds.includes(activeResult.id)) {
+                    setActiveResult(null);
+                  }
+                  setSelectedRecordIds([]);
+                  await loadRecords(selectedAssessmentFilter);
+                } catch (err) {
+                  console.error('Failed to delete selected records:', err);
+                  setRecordsError(err.message || 'Failed to delete selected records.');
+                }
+              }}
+              disabled={loadingRecords}
+              title="Delete all selected records"
+            >
+              🗑️ Delete Selected ({selectedRecordIds.length})
+            </button>
+          )}
           <button
             className="btn btn-danger btn-sm"
             onClick={async () => {
@@ -232,6 +275,16 @@ export default function ResultsReview({ result, onNewEvaluation }) {
           <table className="table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
             <thead>
               <tr style={{ borderBottom: '2px solid var(--border)', textAlign: 'left', color: 'var(--text-secondary)' }}>
+                <th style={{ padding: '0.65rem 0.5rem', width: '38px', textAlign: 'center' }}>
+                  <input
+                    type="checkbox"
+                    checked={records.length > 0 && selectedRecordIds.length === records.length}
+                    onChange={handleToggleSelectAll}
+                    disabled={records.length === 0}
+                    title="Select / Deselect All"
+                    style={{ cursor: 'pointer', width: '15px', height: '15px' }}
+                  />
+                </th>
                 <th style={{ padding: '0.65rem 0.75rem' }}>Submission / File</th>
                 <th style={{ padding: '0.65rem 0.75rem' }}>Assessment</th>
                 <th style={{ padding: '0.65rem 0.75rem' }}>Score</th>
@@ -254,6 +307,14 @@ export default function ResultsReview({ result, onNewEvaluation }) {
                       transition: 'background-color 0.15s ease'
                     }}
                   >
+                    <td style={{ padding: '0.65rem 0.5rem', textAlign: 'center' }} onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={selectedRecordIds.includes(rec.id)}
+                        onChange={() => handleToggleSelectRecord(rec.id)}
+                        style={{ cursor: 'pointer', width: '15px', height: '15px' }}
+                      />
+                    </td>
                     <td style={{ padding: '0.65rem 0.75rem', fontWeight: 600 }}>
                       📄 {rec.submission_filename || (rec.submission_type === 'text' ? 'Pasted Text' : 'File Upload')}
                     </td>

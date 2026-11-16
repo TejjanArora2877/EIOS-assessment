@@ -182,4 +182,13 @@ export const api = {
     });
     return handleResponse(res);
   },
+
+  async deleteSelectedGradingRecords(recordIds) {
+    const res = await fetch(`${API_BASE}/grading/records/delete-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ record_ids: recordIds }),
+    });
+    return handleResponse(res);
+  },
 };

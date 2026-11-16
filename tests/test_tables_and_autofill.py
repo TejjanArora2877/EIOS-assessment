@@ -742,3 +742,141 @@ def test_linearized_table_different_row_subjects_no_false_contradiction():
     assert crit1["awarded_marks"] <= 2.5
 
 
+def test_delete_grading_records_batch_endpoint():
+    """
+    Verifies that POST /api/grading/records/delete-batch deletes selected records in bulk,
+    rejects empty record_ids with 400, and works via the /grading/records/delete-batch route alias.
+    """
+    import uuid
+    from backend.app.routers.grading import _save_grading_record
+    from backend.app.models import GradingResponse, CriterionGradingResult
+
+    assessment_payload = {
+        "title": "Batch Deletion Test Assessment",
+        "question": "What is volatility?",
+        "model_answer": "Volatility refers to how quickly data is lost when power is removed.",
+        "total_marks": 5.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "Volatility Definition",
+                "description": "Explains loss of data upon power disconnection.",
+                "max_marks": 5.0
+            }
+        ]
+    }
+    create_res = client.post("/assessments", json=assessment_payload)
+    assert create_res.status_code == 201
+    aid = create_res.json()["id"]
+
+    id1 = str(uuid.uuid4())
+    id2 = str(uuid.uuid4())
+    id3 = str(uuid.uuid4())
+
+    for rid, score in [(id1, 5.0), (id2, 4.0), (id3, 3.0)]:
+        mock_resp = GradingResponse(
+            id=rid,
+            assessment_id=aid,
+            assessment_title="Batch Deletion Test Assessment",
+            total_score=score,
+            max_score=5.0,
+            percentage=score * 20.0,
+            requires_teacher_review=False,
+            review_reasons=[],
+            overall_feedback="Ok",
+            criterion_breakdown=[
+                CriterionGradingResult(
+                    criterion_name="Volatility Definition",
+                    max_marks=5.0,
+                    awarded_marks=score,
+                    awarded_percentage=score * 20.0,
+                    reason="Ok",
+                    feedback="Ok"
+                )
+            ],
+            citations=[],
+            provenance={"test": True}
+        )
+        _save_grading_record(mock_resp, f"Answer for {rid}", "text")
+
+    # 1. Verify 3 records exist
+    res_list = client.get(f"/api/grading/records?assessment_id={aid}")
+    assert res_list.status_code == 200
+    ids = {r["id"] for r in res_list.json()}
+    assert {id1, id2, id3}.issubset(ids)
+
+    # 2. Reject empty record_ids with 400
+    res_empty_batch = client.post("/api/grading/records/delete-batch", json={"record_ids": []})
+    assert res_empty_batch.status_code == 400
+
+    # 3. Batch delete id1 and id2
+    res_del_batch = client.post("/api/grading/records/delete-batch", json={"record_ids": [id1, id2]})
+    assert res_del_batch.status_code == 200
+    data_batch = res_del_batch.json()
+    assert data_batch["status"] == "deleted"
+    assert data_batch["deleted_count"] == 2
+
+    # 4. Verify id1 and id2 are removed, id3 remains
+    res_after = client.get(f"/api/grading/records?assessment_id={aid}")
+    assert res_after.status_code == 200
+    remaining_ids = {r["id"] for r in res_after.json()}
+    assert id1 not in remaining_ids
+    assert id2 not in remaining_ids
+    assert id3 in remaining_ids
+
+    # 5. Delete remaining id3 via route alias /grading/records/delete-batch
+    res_alias = client.post("/grading/records/delete-batch", json={"record_ids": [id3]})
+    assert res_alias.status_code == 200
+    assert res_alias.json()["deleted_count"] == 1
+
+    # 6. Verify empty for assessment
+    res_final = client.get(f"/api/grading/records?assessment_id={aid}")
+    assert res_final.status_code == 200
+    assert len(res_final.json()) == 0
+
+
+def test_extract_linearized_subject_leading_punctuation():
+    """
+    Verifies that GradingEngine._extract_linearized_subject correctly handles leading colons,
+    hyphens, bullets, and stray whitespace, preventing false-positive contradiction flags.
+    Also verifies AnswerSegmenter cleanly strips leading punctuation from sliced answers.
+    """
+    from backend.app.services.grading_engine import GradingEngine
+    from backend.app.services.answer_segmenter import AnswerSegmenter
+
+    # Test GradingEngine._extract_linearized_subject with various leading punctuation
+    res1 = GradingEngine._extract_linearized_subject(": For Image Type Forensic Duplicate, Destination Drive is Raw Image.")
+    assert res1 is not None
+    assert res1 == ("image type", "forensic duplicate")
+
+    res2 = GradingEngine._extract_linearized_subject("- For Platform Unix, Primary Tool is LiME.")
+    assert res2 is not None
+    assert res2 == ("platform", "unix")
+
+    res3 = GradingEngine._extract_linearized_subject("  :  For Component Kernel, Layer is Ring 0.")
+    assert res3 is not None
+    assert res3 == ("component", "kernel")
+
+    # With known_headers provided
+    res4 = GradingEngine._extract_linearized_subject(
+        ": For Image Type Forensic Duplicate, Destination Drive is Raw Image.",
+        known_headers={"image type", "platform"}
+    )
+    assert res4 == ("image type", "forensic duplicate")
+
+    # Test AnswerSegmenter clean slices
+    questions = [
+        {"id": "q1", "question_order": 1, "question_text": "What is memory volatility?", "model_answer": "Memory is volatile."},
+        {"id": "q2", "question_order": 2, "question_text": "Detail image acquisition specifications.", "model_answer": "For Image Type Forensic Duplicate, Destination Drive is Raw Image."}
+    ]
+    submission_with_colons = (
+        "Question 1: Memory is volatile and cleared upon power loss.\n\n"
+        "Question 2: For Image Type Forensic Duplicate, Destination Drive is Raw Image."
+    )
+    slices = AnswerSegmenter.segment_submission(submission_with_colons, questions)
+    assert "q1" in slices and "q2" in slices
+    # The slice must NOT start with a colon
+    assert not slices["q1"].startswith(":")
+    assert not slices["q2"].startswith(":")
+    assert slices["q2"].startswith("For Image Type Forensic Duplicate")
+

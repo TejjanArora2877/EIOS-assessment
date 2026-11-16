@@ -155,6 +155,9 @@ class GradingResponse(BaseModel):
     provenance: Dict[str, Any]
     question_results: Optional[List[QuestionGradingResult]] = None
 
+class DeleteRecordsBatchRequest(BaseModel):
+    record_ids: List[str]
+
 # -------------------------------------------------------------
 # Health and System Status
 # -------------------------------------------------------------

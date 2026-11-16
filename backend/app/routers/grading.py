@@ -17,7 +17,8 @@ from backend.app.models import (
     BatchJobResponse,
     CriterionGradingResult,
     EvidenceCitation,
-    QuestionGradingResult
+    QuestionGradingResult,
+    DeleteRecordsBatchRequest
 )
 from backend.app.routers.assessments import _fetch_assessment_by_id
 from backend.app.services.text_extractor import TextExtractor
@@ -183,6 +184,24 @@ def delete_grading_records(assessment_id: Optional[str] = None):
             cursor.execute("DELETE FROM grading_records WHERE assessment_id = ?", (assessment_id,))
         else:
             cursor.execute("DELETE FROM grading_records")
+        deleted_count = cursor.rowcount
+    return {"status": "deleted", "deleted_count": deleted_count}
+
+@router.post("/records/delete-batch")
+def delete_grading_records_batch(payload: DeleteRecordsBatchRequest):
+    """
+    Deletes a list of grading records from SQLite by their IDs.
+    """
+    if not payload.record_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="record_ids list cannot be empty."
+        )
+
+    placeholders = ",".join("?" for _ in payload.record_ids)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"DELETE FROM grading_records WHERE id IN ({placeholders})", tuple(payload.record_ids))
         deleted_count = cursor.rowcount
     return {"status": "deleted", "deleted_count": deleted_count}
 
