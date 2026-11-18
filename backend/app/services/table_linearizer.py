@@ -52,6 +52,193 @@ class TableLinearizer:
         r'(?i)\b(mark|marks|point|points|score|weight|weightage|max)\b'
     )
 
+    PDF_TABLE_SETTINGS = {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "lines",
+        "snap_tolerance": 4,
+        "join_tolerance": 4,
+    }
+
+    @classmethod
+    def clean_cell_text(cls, cell: Optional[str]) -> str:
+        """
+        Normalizes table cell text by joining line-wrap hyphens and replacing
+        internal newlines with spaces.
+        """
+        if not cell:
+            return ""
+        c = re.sub(r'([A-Za-z]{3,})-\s*\n\s*([a-z]{2,})', r'\1-\2', str(cell))
+        c = re.sub(r'-\s*\n\s*', '-', c)
+        c = re.sub(r'\s*\n\s*', ' ', c)
+        return re.sub(r'\s+', ' ', c).strip()
+
+    @classmethod
+    def normalize_pdf_text(cls, raw_text: str) -> str:
+        """
+        Normalizes extracted PDF text by:
+        1. Cleaning mid-word hyphenated line breaks (e.g. 'subword-\nsegmentation' -> 'subword-segmentation').
+        2. Rejoining soft line wraps within visual paragraphs into single spaces while
+           preserving genuine paragraph breaks (\n\n) and structural line boundaries
+           (headers, list bullets, table pipes).
+        """
+        if not raw_text:
+            return ""
+
+        # 1. Clean mid-word hyphenated line breaks
+        text = re.sub(r'([A-Za-z]{3,})-\s*\n\s*([a-z]{2,})', r'\1-\2', raw_text)
+        text = re.sub(r'-\s*\n\s*', '-', text)
+
+        # 2. Split by genuine paragraph breaks (2 or more newlines)
+        paragraphs = re.split(r'\n\s*\n+', text)
+        normalized_paragraphs: List[str] = []
+
+        question_label_pattern = re.compile(
+            r'(?i)^\s*(?:question|ques|q|problem|part)\s*[\.\:\-\)]*\s*(?:\d+|[a-zA-Z])\s*[:\.\-\)]?\s*$'
+        )
+        header_re = re.compile(
+            r'(?i)^\s*(?:question|ques|q|problem|part|model\s+answer|authoritative\s+answer|expected\s+answer|sample\s+answer|rubric|grading\s+criteria|marking\s+criteria|marking\s+scheme|criteria|title|assessment\s+title)\b'
+        )
+        bullet_re = re.compile(r'^\s*(?:[-*•]|\d+[\.)]|\([0-9a-zA-Z]+\))\s+')
+
+        for p in paragraphs:
+            p_clean = p.strip()
+            if not p_clean:
+                continue
+
+            lines = [l.strip() for l in p_clean.splitlines() if l.strip()]
+            if not lines:
+                continue
+
+            joined_lines: List[str] = []
+            for line in lines:
+                is_boundary = (
+                    bool(question_label_pattern.match(line))
+                    or bool(header_re.match(line))
+                    or bool(bullet_re.match(line))
+                    or line.startswith("|")
+                    or bool(re.match(r'^(?:page\s*\d+(?:\s*(?:of|/)\s*\d+)?|\d+|-+\s*\d+\s*-+|page\s*[-–—]\s*\d+)$', line, re.IGNORECASE))
+                )
+
+                if is_boundary or not joined_lines:
+                    joined_lines.append(line)
+                else:
+                    prev = joined_lines[-1]
+                    if (
+                        prev.startswith("|")
+                        or bool(question_label_pattern.match(prev))
+                        or bool(header_re.match(prev))
+                        or bool(re.search(r'\b(?:continued|cont\.?)\b', prev, re.IGNORECASE))
+                    ):
+                        joined_lines.append(line)
+                    else:
+                        joined_lines[-1] = prev + " " + line
+
+            normalized_paragraphs.append("\n".join(joined_lines))
+
+        return "\n\n".join(normalized_paragraphs)
+
+    @classmethod
+    def _merge_wrapped_rows(
+        cls,
+        headers: List[str],
+        rows: List[List[str]]
+    ) -> List[List[str]]:
+        """
+        Merges wrapped partial rows inside extracted tables. If a row has an empty
+        first column (and empty last column for 3+ column tables), merge its non-empty
+        cell strings into the preceding row.
+        """
+        if not rows:
+            return []
+        merged: List[List[str]] = []
+        for row in rows:
+            if not row:
+                continue
+            row_clean = [cls.clean_cell_text(c) for c in row]
+            is_continuation = False
+            if merged:
+                first_empty = not row_clean[0]
+                if len(row_clean) >= 3:
+                    last_empty = not row_clean[-1]
+                    if first_empty and last_empty:
+                        is_continuation = True
+                elif len(row_clean) == 2:
+                    if first_empty:
+                        is_continuation = True
+
+            if is_continuation:
+                prev = merged[-1]
+                for c in range(min(len(prev), len(row_clean))):
+                    val = row_clean[c]
+                    if val:
+                        prev[c] = (prev[c] + " " + val).strip()
+            else:
+                merged.append(row_clean)
+        return merged
+
+    @classmethod
+    def _stitch_continuation_tables(cls, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Stitches tables that span across page breaks or are separated at most by
+        page number/noise text.
+        """
+        if not blocks or len(blocks) < 2:
+            return blocks
+
+        def _is_ignorable_page_noise(b: Dict[str, Any]) -> bool:
+            if b.get("type") != "text":
+                return False
+            t = (b.get("text") or "").strip()
+            if not t:
+                return True
+            return bool(re.match(
+                r'^(?:page\s*\d+(?:\s*(?:of|/)\s*\d+)?|\d+|-+\s*\d+\s*-+|page\s*[-–—]\s*\d+)$',
+                t,
+                re.IGNORECASE
+            ))
+
+        i = 0
+        while i < len(blocks):
+            b1 = blocks[i]
+            if b1.get("type") == "table":
+                H1 = b1.get("headers", [])
+                R1 = b1.get("rows", [])
+
+                # Look ahead for next non-noise block
+                j = i + 1
+                noise_indices = []
+                while j < len(blocks) and _is_ignorable_page_noise(blocks[j]):
+                    noise_indices.append(j)
+                    j += 1
+
+                if j < len(blocks) and blocks[j].get("type") == "table":
+                    b2 = blocks[j]
+                    H2 = b2.get("headers", [])
+                    R2 = b2.get("rows", [])
+
+                    if len(H1) == len(H2) and len(H1) > 0:
+                        H1_clean = [cls.clean_cell_text(c) for c in H1]
+                        H2_clean = [cls.clean_cell_text(c) for c in H2]
+
+                        H1_norm = [c.strip().lower() for c in H1_clean]
+                        H2_norm = [c.strip().lower() for c in H2_clean]
+
+                        if H1_norm == H2_norm:
+                            # Repeated header row on the new page
+                            R1.extend(R2)
+                        else:
+                            # Continuation data row of the split table
+                            # (applicable to both rubric tables and comparison/data tables)
+                            R1.append(H2_clean)
+                            R1.extend(R2)
+
+                        b1["rows"] = cls._merge_wrapped_rows(H1_clean, R1)
+                        indices_to_remove = set([j] + noise_indices)
+                        blocks = [b for idx, b in enumerate(blocks) if idx not in indices_to_remove]
+                        continue
+            i += 1
+        return blocks
+
     @classmethod
     def is_rubric_table(cls, headers: List[str]) -> bool:
         """
@@ -169,7 +356,23 @@ class TableLinearizer:
                 stripped = stripped[1:]
             if stripped.endswith("|"):
                 stripped = stripped[:-1]
-            return [re.sub(r'\s+', ' ', c).strip() for c in stripped.split("|")]
+
+            # Mask mathematical cardinality/norm expressions e.g. |G|, |N|, |V_D|, |w|
+            math_pipes: List[str] = []
+            def mask_math(m):
+                idx = len(math_pipes)
+                math_pipes.append(m.group(0))
+                return f"__MATH_CARD_{idx}__"
+
+            masked = re.sub(r'\|([A-Za-z0-9_\\^]+)\|', mask_math, stripped)
+
+            cells = []
+            for c in masked.split("|"):
+                cleaned_c = re.sub(r'\s+', ' ', c).strip()
+                for idx, orig in enumerate(math_pipes):
+                    cleaned_c = cleaned_c.replace(f"__MATH_CARD_{idx}__", orig)
+                cells.append(cleaned_c)
+            return cells
 
         while i < len(lines):
             line = lines[i].strip()
@@ -197,6 +400,37 @@ class TableLinearizer:
         return "\n".join(output_lines)
 
     @classmethod
+    def render_blocks_to_text(cls, blocks: List[Dict[str, Any]]) -> str:
+        """
+        Renders ordered document blocks into unified linearized text:
+        - For 'text' blocks: emits block['text'].
+        - For 'table' blocks: emits cls.linearize_table(block['headers'], block['rows']).
+        """
+        elements: List[str] = []
+        for b in blocks:
+            b_type = b.get("type")
+            if b_type == "text":
+                txt = (b.get("text") or "").strip()
+                if txt:
+                    elements.append(txt)
+            elif b_type == "table":
+                headers = b.get("headers", [])
+                rows = b.get("rows", [])
+                linearized = cls.linearize_table(headers, rows)
+                if linearized:
+                    elements.append(linearized)
+        return "\n\n".join(elements)
+
+    @classmethod
+    def extract_linearized_text(cls, filename: str, file_bytes: bytes) -> str:
+        """
+        Extracts ordered document blocks with multi-page table stitching and wrapped row
+        merging, and renders them into declarative linearized text.
+        """
+        blocks = cls.extract_document_blocks(filename, file_bytes)
+        return cls.render_blocks_to_text(blocks)
+
+    @classmethod
     def extract_docx_with_tables(cls, file_input: Any) -> Dict[str, Any]:
         """
         Extracts paragraphs and tables from a DOCX file in exact document reading order.
@@ -204,195 +438,16 @@ class TableLinearizer:
         """
         if not HAS_DOCX:
             raise RuntimeError("python-docx is not installed in the environment.")
-
-        if isinstance(file_input, (bytes, bytearray)):
-            doc = DocxDocument(io.BytesIO(file_input))
-        else:
-            doc = DocxDocument(file_input)
-
-        elements: List[str] = []
-        raw_tables: List[Dict[str, Any]] = []
-
-        for child in doc.element.body:
-            if isinstance(child, CT_P):
-                p = Paragraph(child, doc)
-                p_text = p.text.strip()
-                if p_text:
-                    elements.append(cls.linearize_markdown_tables(p_text))
-            elif isinstance(child, CT_Tbl):
-                tbl = Table(child, doc)
-                raw_rows: List[List[str]] = []
-                for row in tbl.rows:
-                    row_cells = [re.sub(r'\s+', ' ', cell.text).strip() for cell in row.cells]
-                    raw_rows.append(row_cells)
-
-                if raw_rows:
-                    headers = raw_rows[0]
-                    data_rows = raw_rows[1:]
-                    raw_tables.append({
-                        "headers": headers,
-                        "rows": data_rows
-                    })
-                    linearized = cls.linearize_table(headers, data_rows)
-                    if linearized:
-                        elements.append(linearized)
-
-        full_text = "\n\n".join(e for e in elements if e)
-        return {
-            "total_pages": None,
-            "pages": [{"page_number": None, "text": full_text}],
-            "full_text": full_text,
-            "tables": raw_tables
-        }
+        return cls.extract_from_file(file_input, filename="document.docx")
 
     @classmethod
     def extract_pdf_with_tables(cls, file_input: Any) -> Dict[str, Any]:
         """
-        Extracts text and tables from a PDF document.
-        Uses pdfplumber to detect table bounding boxes and interleave linearized
-        tables with surrounding page text in vertical reading order.
-        Falls back to PyMuPDF if pdfplumber is unavailable or encounters parsing errors.
+        Extracts text and tables from a PDF document in exact vertical reading order.
+        Linearizes tables into declarative sentences inline with multi-page table stitching.
         """
-        pages_data: List[Dict[str, Any]] = []
-        raw_tables: List[Dict[str, Any]] = []
-        total_pages = 0
+        return cls.extract_from_file(file_input, filename="document.pdf")
 
-        # Primary extraction: pdfplumber
-        if HAS_PDFPLUMBER:
-            try:
-                pdf_source = io.BytesIO(file_input) if isinstance(file_input, (bytes, bytearray)) else file_input
-                with pdfplumber.open(pdf_source) as pdf:
-                    total_pages = len(pdf.pages)
-                    for page_idx, page in enumerate(pdf.pages):
-                        tables = page.find_tables()
-                        if not tables:
-                            page_text = page.extract_text() or ""
-                            page_text = cls.linearize_markdown_tables(page_text.strip())
-                            if page_text:
-                                pages_data.append({
-                                    "page_number": page_idx + 1,
-                                    "text": page_text
-                                })
-                            continue
-
-                        # Interleave text and tables by vertical y0 (bbox[1])
-                        sorted_tables = sorted(tables, key=lambda t: t.bbox[1])
-                        page_parts: List[str] = []
-                        last_bottom = 0.0
-
-                        for t in sorted_tables:
-                            t_top = t.bbox[1]
-                            t_bottom = t.bbox[3]
-
-                            # Extract text slice above this table
-                            if t_top > last_bottom:
-                                try:
-                                    slice_crop = page.crop((0, last_bottom, page.width, t_top))
-                                    slice_text = slice_crop.extract_text() or ""
-                                    if slice_text.strip():
-                                        page_parts.append(cls.linearize_markdown_tables(slice_text.strip()))
-                                except Exception:
-                                    pass
-
-                            # Extract and linearize table
-                            t_data = t.extract()
-                            if t_data and len(t_data) >= 1:
-                                headers = [re.sub(r'\s+', ' ', (c or "")).strip() for c in t_data[0]]
-                                data_rows = [
-                                    [re.sub(r'\s+', ' ', (c or "")).strip() for c in row]
-                                    for row in t_data[1:]
-                                ]
-                                raw_tables.append({
-                                    "page": page_idx + 1,
-                                    "headers": headers,
-                                    "rows": data_rows
-                                })
-                                linearized = cls.linearize_table(headers, data_rows)
-                                if linearized:
-                                    page_parts.append(linearized)
-
-                            last_bottom = max(last_bottom, t_bottom)
-
-                        # Extract text slice below the last table
-                        if last_bottom < page.height:
-                            try:
-                                bottom_crop = page.crop((0, last_bottom, page.width, page.height))
-                                bottom_text = bottom_crop.extract_text() or ""
-                                if bottom_text.strip():
-                                    page_parts.append(cls.linearize_markdown_tables(bottom_text.strip()))
-                            except Exception:
-                                pass
-
-                        combined_page_text = "\n\n".join(p for p in page_parts if p)
-                        if combined_page_text:
-                            pages_data.append({
-                                "page_number": page_idx + 1,
-                                "text": combined_page_text
-                            })
-
-                full_text = "\n\n".join(p["text"] for p in pages_data)
-                return {
-                    "total_pages": total_pages,
-                    "pages": pages_data,
-                    "full_text": full_text,
-                    "tables": raw_tables
-                }
-            except Exception as e:
-                logger.warning(f"[TableLinearizer] pdfplumber extraction failed, falling back to PyMuPDF: {e}")
-
-        # Fallback extraction: PyMuPDF (fitz)
-        if HAS_FITZ:
-            doc = fitz.open(stream=file_input, filetype="pdf") if isinstance(file_input, (bytes, bytearray)) else fitz.open(file_input)
-            total_pages = len(doc)
-            for page_idx in range(total_pages):
-                page = doc[page_idx]
-                page_text_parts: List[str] = []
-
-                # Check if PyMuPDF table finder is supported
-                tab_finder = None
-                try:
-                    tab_finder = page.find_tables()
-                except Exception:
-                    tab_finder = None
-
-                if tab_finder and hasattr(tab_finder, "tables") and tab_finder.tables:
-                    for t in tab_finder.tables:
-                        t_data = t.extract()
-                        if t_data and len(t_data) >= 1:
-                            headers = [re.sub(r'\s+', ' ', (c or "")).strip() for c in t_data[0]]
-                            data_rows = [
-                                [re.sub(r'\s+', ' ', (c or "")).strip() for c in row]
-                                for row in t_data[1:]
-                            ]
-                            raw_tables.append({
-                                "page": page_idx + 1,
-                                "headers": headers,
-                                "rows": data_rows
-                            })
-                            linearized = cls.linearize_table(headers, data_rows)
-                            if linearized:
-                                page_text_parts.append(linearized)
-
-                raw_text = page.get_text("text").strip()
-                if raw_text:
-                    page_text_parts.insert(0, cls.linearize_markdown_tables(raw_text))
-
-                comb = "\n\n".join(page_text_parts)
-                if comb:
-                    pages_data.append({
-                        "page_number": page_idx + 1,
-                        "text": comb
-                    })
-
-            full_text = "\n\n".join(p["text"] for p in pages_data)
-            return {
-                "total_pages": total_pages,
-                "pages": pages_data,
-                "full_text": full_text,
-                "tables": raw_tables
-            }
-
-        raise RuntimeError("No PDF extraction library (pdfplumber or PyMuPDF) is available.")
 
     @classmethod
     def _parse_text_blocks(cls, raw_text: str) -> List[Dict[str, Any]]:
@@ -415,7 +470,23 @@ class TableLinearizer:
                 stripped = stripped[1:]
             if stripped.endswith("|"):
                 stripped = stripped[:-1]
-            return [re.sub(r'\s+', ' ', c).strip() for c in stripped.split("|")]
+
+            # Mask mathematical cardinality/norm expressions e.g. |G|, |N|, |V_D|, |w|
+            math_pipes: List[str] = []
+            def mask_math(m):
+                idx = len(math_pipes)
+                math_pipes.append(m.group(0))
+                return f"__MATH_CARD_{idx}__"
+
+            masked = re.sub(r'\|([A-Za-z0-9_\\^]+)\|', mask_math, stripped)
+
+            cells = []
+            for c in masked.split("|"):
+                cleaned_c = re.sub(r'\s+', ' ', c).strip()
+                for idx, orig in enumerate(math_pipes):
+                    cleaned_c = cleaned_c.replace(f"__MATH_CARD_{idx}__", orig)
+                cells.append(cleaned_c)
+            return cells
 
         i = 0
         while i < len(lines):
@@ -502,29 +573,45 @@ class TableLinearizer:
                     tbl = Table(child, doc)
                     raw_rows: List[List[str]] = []
                     for row in tbl.rows:
-                        row_cells = [re.sub(r'\s+', ' ', cell.text).strip() for cell in row.cells]
+                        row_cells = [cls.clean_cell_text(cell.text) for cell in row.cells]
                         raw_rows.append(row_cells)
                     if raw_rows:
                         headers = raw_rows[0]
-                        data_rows = raw_rows[1:]
+                        data_rows = cls._merge_wrapped_rows(headers, raw_rows[1:])
                         blocks.append({
                             "type": "table",
                             "headers": headers,
                             "rows": data_rows
                         })
-            return blocks
+            return cls._stitch_continuation_tables(blocks)
 
         elif ext == ".pdf":
             blocks: List[Dict[str, Any]] = []
             if HAS_PDFPLUMBER:
                 try:
                     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                        for page in pdf.pages:
-                            tables = page.find_tables()
+                        for page_idx, page in enumerate(pdf.pages):
+                            try:
+                                settings_tables = page.find_tables(table_settings=cls.PDF_TABLE_SETTINGS)
+                            except Exception:
+                                settings_tables = []
+                            try:
+                                default_tables = page.find_tables()
+                            except Exception:
+                                default_tables = []
+
+                            if len(settings_tables) >= len(default_tables) and len(settings_tables) > 0:
+                                tables = settings_tables
+                                active_settings = cls.PDF_TABLE_SETTINGS
+                            else:
+                                tables = default_tables
+                                active_settings = None
+
                             if not tables:
                                 page_text = page.extract_text() or ""
+                                page_text = cls.normalize_pdf_text(page_text)
                                 if page_text.strip():
-                                    blocks.extend(cls._parse_text_blocks(page_text.strip()))
+                                    blocks.extend([{**b, "page": page_idx + 1} for b in cls._parse_text_blocks(page_text.strip())])
                                 continue
 
                             sorted_tables = sorted(tables, key=lambda t: t.bbox[1])
@@ -536,22 +623,33 @@ class TableLinearizer:
                                     try:
                                         crop = page.crop((0, last_bottom, page.width, t_top))
                                         txt = crop.extract_text() or ""
+                                        txt = cls.normalize_pdf_text(txt)
                                         if txt.strip():
-                                            blocks.extend(cls._parse_text_blocks(txt.strip()))
+                                            blocks.extend([{**b, "page": page_idx + 1} for b in cls._parse_text_blocks(txt.strip())])
                                     except Exception:
                                         pass
 
-                                t_data = t.extract()
+                                t_data = None
+                                if active_settings:
+                                    try:
+                                        t_data = t.extract(table_settings=active_settings)
+                                    except Exception:
+                                        t_data = None
+                                if not t_data:
+                                    t_data = t.extract()
+
                                 if t_data and len(t_data) >= 1:
-                                    headers = [re.sub(r'\s+', ' ', (c or "")).strip() for c in t_data[0]]
+                                    headers = [cls.clean_cell_text(c) for c in t_data[0]]
                                     data_rows = [
-                                        [re.sub(r'\s+', ' ', (c or "")).strip() for c in row]
+                                        [cls.clean_cell_text(c) for c in row]
                                         for row in t_data[1:]
                                     ]
+                                    data_rows = cls._merge_wrapped_rows(headers, data_rows)
                                     blocks.append({
                                         "type": "table",
                                         "headers": headers,
-                                        "rows": data_rows
+                                        "rows": data_rows,
+                                        "page": page_idx + 1
                                     })
                                 last_bottom = max(last_bottom, t_bottom)
 
@@ -559,27 +657,29 @@ class TableLinearizer:
                                 try:
                                     crop = page.crop((0, last_bottom, page.width, page.height))
                                     txt = crop.extract_text() or ""
+                                    txt = cls.normalize_pdf_text(txt)
                                     if txt.strip():
-                                        blocks.extend(cls._parse_text_blocks(txt.strip()))
+                                        blocks.extend([{**b, "page": page_idx + 1} for b in cls._parse_text_blocks(txt.strip())])
                                 except Exception:
                                     pass
-                    return blocks
+                    return cls._stitch_continuation_tables(blocks)
                 except Exception as e:
                     logger.warning(f"[TableLinearizer] pdfplumber block extraction failed, falling back to PyMuPDF: {e}")
 
             if HAS_FITZ:
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
-                for page in doc:
+                for page_idx, page in enumerate(doc):
                     txt = page.get_text("text").strip()
+                    txt = cls.normalize_pdf_text(txt)
                     if txt:
-                        blocks.extend(cls._parse_text_blocks(txt))
-                return blocks
+                        blocks.extend([{**b, "page": page_idx + 1} for b in cls._parse_text_blocks(txt)])
+                return cls._stitch_continuation_tables(blocks)
 
             raise RuntimeError("No PDF extraction library available.")
 
         else:
             raw_text = file_bytes.decode("utf-8", errors="replace")
-            return cls._parse_text_blocks(raw_text)
+            return cls._stitch_continuation_tables(cls._parse_text_blocks(raw_text))
 
     @classmethod
     def extract_from_file(
@@ -589,33 +689,58 @@ class TableLinearizer:
     ) -> Dict[str, Any]:
         """
         Unified document extractor for .docx, .pdf, .txt, .md, and .csv files.
-        Accepts either a filesystem path (str) or raw bytes.
+        Routes all formats through extract_document_blocks with multi-page table stitching,
+        wrapped row merging, and propositional table linearization.
         """
-        ext = ""
+        name = "document"
         if filename:
-            _, ext = os.path.splitext(filename)
+            name = filename
         elif isinstance(file_input, str):
-            _, ext = os.path.splitext(file_input)
+            name = file_input
 
+        _, ext = os.path.splitext(name)
         ext = ext.lower()
 
-        if ext == ".docx":
-            return cls.extract_docx_with_tables(file_input)
-        elif ext == ".pdf":
-            return cls.extract_pdf_with_tables(file_input)
-        elif ext in [".txt", ".md", ".csv", ""]:
-            if isinstance(file_input, (bytes, bytearray)):
-                raw_text = file_input.decode("utf-8", errors="replace")
-            else:
-                with open(file_input, "r", encoding="utf-8", errors="replace") as f:
-                    raw_text = f.read()
+        if isinstance(file_input, (bytes, bytearray)):
+            file_bytes = bytes(file_input)
+        elif isinstance(file_input, str):
+            with open(file_input, "rb") as f:
+                file_bytes = f.read()
+        elif hasattr(file_input, "read"):
+            file_bytes = file_input.read()
+        else:
+            raise ValueError(f"Unsupported file_input type: {type(file_input)}")
 
-            linearized_text = cls.linearize_markdown_tables(raw_text.strip())
+        if ext in [".pdf", ".docx", ".txt", ".md", ".csv", ""]:
+            blocks = cls.extract_document_blocks(name, file_bytes)
+            full_text = cls.render_blocks_to_text(blocks)
+
+            raw_tables = [
+                {"headers": b["headers"], "rows": b["rows"]}
+                for b in blocks if b.get("type") == "table"
+            ]
+
+            if ext == ".pdf":
+                # Build per-page text list
+                page_map: Dict[int, List[Dict[str, Any]]] = {}
+                for b in blocks:
+                    p_num = b.get("page", 1)
+                    page_map.setdefault(p_num, []).append(b)
+
+                total_pages = max(page_map.keys()) if page_map else 1
+                pages = [
+                    {"page_number": p, "text": cls.render_blocks_to_text(p_blocks)}
+                    for p, p_blocks in sorted(page_map.items())
+                ]
+            else:
+                total_pages = None
+                pages = [{"page_number": None, "text": full_text}]
+
             return {
-                "total_pages": None,
-                "pages": [{"page_number": None, "text": linearized_text}],
-                "full_text": linearized_text,
-                "tables": []
+                "total_pages": total_pages,
+                "pages": pages,
+                "full_text": full_text,
+                "tables": raw_tables
             }
         else:
             raise ValueError(f"Unsupported file format: '{ext}'. Only PDF, DOCX, TXT, and MD are supported.")

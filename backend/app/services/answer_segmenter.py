@@ -33,6 +33,10 @@ ANCHOR_REGEX = re.compile(
     r')'
 )
 
+INLINE_ANCHOR_REGEX = re.compile(
+    r'(?im)^\s*(?:question|ques|q)\s*(\d+)\s*[:\.\-\)]\s+'
+)
+
 EXPLICIT_PREFIX_REGEX = re.compile(
     r'(?im)^\s*(?:question|ques|q|answer|ans|part)\s*[\.\:\-\)]*\s*(\d+|[a-zA-Z])\b'
 )
@@ -99,7 +103,27 @@ class AnswerSegmenter:
         order_to_qid: Dict[int, str]
     ) -> Optional[Dict[str, str]]:
         matches = []
+        seen_starts = set()
+
+        # Check inline explicit Question N: <body text> anchors
+        for m in INLINE_ANCHOR_REGEX.finditer(text):
+            raw_lbl = m.group(1)
+            if raw_lbl and raw_lbl.isdigit():
+                target_order = int(raw_lbl)
+                if target_order in order_to_qid:
+                    matches.append({
+                        "start": m.start(),
+                        "end": m.end(),
+                        "order": target_order,
+                        "qid": order_to_qid[target_order],
+                        "is_explicit": True,
+                    })
+                    seen_starts.add(m.start())
+
+        # Check general anchor regex
         for m in ANCHOR_REGEX.finditer(text):
+            if m.start() in seen_starts:
+                continue
             raw_lbl = m.group(1) or m.group(2) or m.group(3)
             if not raw_lbl:
                 continue
@@ -119,6 +143,7 @@ class AnswerSegmenter:
                     "qid": order_to_qid[target_order],
                     "is_explicit": is_explicit,
                 })
+                seen_starts.add(m.start())
 
         if not matches:
             return None
@@ -140,7 +165,6 @@ class AnswerSegmenter:
         matches.sort(key=lambda x: x["start"])
 
         # Slice text between consecutive boundaries
-        # Text prior to matches[0]["start"] is discarded (e.g. headers, student metadata)
         slices: Dict[str, str] = {}
         for i, m in enumerate(matches):
             qid = m["qid"]
@@ -154,7 +178,30 @@ class AnswerSegmenter:
             else:
                 slices[qid] = chunk
 
+        # If the first matched anchor has anchor_num > 1 (e.g. Question 3: is the first explicit anchor found)
+        # and non-trivial pre-anchor text (>= 80 chars) precedes it while q1 is empty,
+        # assign that pre-anchor text to q1 rather than discarding it as cover-page noise.
+        if matches and matches[0]["order"] > 1 and 1 in order_to_qid:
+            qid_1 = order_to_qid[1]
+            if not slices.get(qid_1, "").strip():
+                pre_text = text[:matches[0]["start"]].strip()
+                if len(pre_text) >= 80:
+                    m_inline_q1 = re.search(
+                        r'(?im)^\s*(?:question|ques|q)\s*1\s*[:\.\-\)]\s*(.*)',
+                        pre_text,
+                        re.DOTALL
+                    )
+                    if m_inline_q1:
+                        q1_body = m_inline_q1.group(1).strip()
+                    else:
+                        q1_body = pre_text
+                    q1_body = re.sub(r'^[\s:\-\)\.]+', '', q1_body).strip()
+                    if q1_body:
+                        slices[qid_1] = q1_body
+
         return slices
+
+    _stage1_explicit_anchors = _stage1_structural_anchors
 
     @classmethod
     def _stage2_semantic_routing(cls, text: str, questions: List[Any]) -> Dict[str, str]:
@@ -234,4 +281,93 @@ class AnswerSegmenter:
             qid = _get_qid(q, idx)
             raw = (slices.get(qid) or "").strip()
             final_slices[qid] = re.sub(r'^[\s:\-\)\.]+', '', raw).strip()
+
+        # Check if one or more interior or trailing questions are empty
+        empty_entries = [
+            (idx, q, _get_qid(q, idx))
+            for idx, q in enumerate(questions)
+            if not final_slices.get(_get_qid(q, idx), "").strip()
+        ]
+        if not empty_entries:
+            return final_slices
+
+        # Check if any host question holds a long multi-block slice (>= 4 blocks)
+        from backend.app.services.models_loader import ModelsLoader
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        for host_idx, host_q in enumerate(questions):
+            host_qid = _get_qid(host_q, host_idx)
+            host_text = final_slices.get(host_qid, "").strip()
+            if not host_text:
+                continue
+
+            raw_blocks = [b.strip() for b in re.split(r'\n\s*\n+', host_text) if b.strip()]
+            if len(raw_blocks) < 4:
+                continue
+
+            host_prompt = (
+                (_get_q_field(host_q, "question_text", "") or "")
+                + " "
+                + (_get_q_field(host_q, "model_answer", "") or "")
+            ).strip()
+            if not host_prompt:
+                continue
+
+            host_emb = ModelsLoader.encode_texts([host_prompt])[0]
+            block_embs = ModelsLoader.encode_texts(raw_blocks)
+            sims_host = cosine_similarity(block_embs, [host_emb]).flatten()
+
+            for empty_idx, empty_q, empty_qid in empty_entries:
+                if final_slices.get(empty_qid, "").strip():
+                    continue
+
+                empty_prompt = (
+                    (_get_q_field(empty_q, "question_text", "") or "")
+                    + " "
+                    + (_get_q_field(empty_q, "model_answer", "") or "")
+                ).strip()
+                if not empty_prompt:
+                    continue
+
+                empty_emb = ModelsLoader.encode_texts([empty_prompt])[0]
+                sims_empty = cosine_similarity(block_embs, [empty_emb]).flatten()
+
+                # Find longest contiguous sequence of blocks where sim_empty > sim_host + 0.02
+                best_seq_start = -1
+                best_seq_len = 0
+                curr_start = -1
+                curr_len = 0
+
+                for b_i in range(len(raw_blocks)):
+                    if sims_empty[b_i] > sims_host[b_i] + 0.02 and sims_empty[b_i] >= 0.28:
+                        if curr_start == -1:
+                            curr_start = b_i
+                            curr_len = 1
+                        else:
+                            curr_len += 1
+                    else:
+                        if curr_len > best_seq_len:
+                            best_seq_start = curr_start
+                            best_seq_len = curr_len
+                        curr_start = -1
+                        curr_len = 0
+
+                if curr_len > best_seq_len:
+                    best_seq_start = curr_start
+                    best_seq_len = curr_len
+
+                if best_seq_start >= 0 and best_seq_len >= 1 and (len(raw_blocks) - best_seq_len) >= 1:
+                    rescued_blocks = raw_blocks[best_seq_start : best_seq_start + best_seq_len]
+                    remaining_blocks = raw_blocks[:best_seq_start] + raw_blocks[best_seq_start + best_seq_len:]
+
+                    final_slices[empty_qid] = "\n\n".join(rescued_blocks).strip()
+                    final_slices[host_qid] = "\n\n".join(remaining_blocks).strip()
+
+                    raw_blocks = remaining_blocks
+                    if len(raw_blocks) >= 4:
+                        block_embs = ModelsLoader.encode_texts(raw_blocks)
+                        sims_host = cosine_similarity(block_embs, [host_emb]).flatten()
+                    else:
+                        break
+
         return final_slices

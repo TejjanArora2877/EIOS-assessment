@@ -9,6 +9,7 @@ from backend.app.database import init_db
 from backend.app.services.table_linearizer import TableLinearizer
 from backend.app.services.answer_segmenter import AnswerSegmenter
 from backend.app.services.assessment_parser import AssessmentDocumentParser
+from backend.app.services.text_extractor import TextExtractor
 
 client = TestClient(app)
 
@@ -402,7 +403,6 @@ Packet analysis inspects protocol headers and payload data.
     assert q2["criteria"][0]["name"] == "Packet Inspection"
     assert q2["criteria"][0]["max_marks"] == 5.0
     assert q2["max_marks"] == 5.0
-
 
 def test_stored_grading_records_history_and_api():
     """
@@ -879,4 +879,483 @@ def test_extract_linearized_subject_leading_punctuation():
     assert not slices["q1"].startswith(":")
     assert not slices["q2"].startswith(":")
     assert slices["q2"].startswith("For Image Type Forensic Duplicate")
+
+
+def test_multipage_pdf_table_stitching_and_continuity():
+    """
+    Verifies multi-page PDF assessment parsing:
+    1. A rubric table split across pages without a repeated header stitches cleanly
+       with 0 rubric rows leaked into model_answer or question_text.
+    2. A multi-page Model Answer spanning across page breaks remains attached to its parent
+       question rather than creating phantom questions.
+    3. Wrapped cells and hyphenated line-breaks are cleanly joined.
+    """
+    import io
+    import fitz
+    from backend.app.services.table_linearizer import TableLinearizer
+
+    # 1. Direct unit verification of cell cleaning and wrapped row merging
+    assert TableLinearizer.clean_cell_text("subword-\nsegmentation") == "subword-segmentation"
+    assert TableLinearizer.clean_cell_text("first line\nsecond line") == "first line second line"
+
+    raw_rubric_rows = [
+        ["Attention Mechanism", "Computes atten-\ntion weights", "5.0"],
+        ["", "and projects value vectors.", ""]
+    ]
+    merged_rows = TableLinearizer._merge_wrapped_rows(["Criterion", "Description", "Marks"], raw_rubric_rows)
+    assert len(merged_rows) == 1
+    assert merged_rows[0][0] == "Attention Mechanism"
+    assert "atten-tion weights and projects value vectors." in merged_rows[0][1]
+    assert merged_rows[0][2] == "5.0"
+
+    # 2. Build multi-page PDF in memory using fitz
+    doc = fitz.open()
+
+    # Page 1: Assessment Title, Q1, Model Answer, Comparison Table, Rubric Header + Row 1 + Wrapped Row
+    p1 = doc.new_page()
+    p1.insert_text(
+        (50, 40),
+        "Natural Language Processing Comprehensive Assessment\n\n"
+        "Question 1: Explain the self-attention mechanism in Transformer models.\n"
+        "Model Answer: The self-attention mechanism computes scaled dot-product similarity.\n",
+        fontsize=9
+    )
+
+    # Comparison Table on Page 1 (Architecture comparison)
+    for y in [120, 140, 160, 180]:
+        p1.draw_line((50, y), (540, y))
+    for x in [50, 170, 340, 540]:
+        p1.draw_line((x, 120), (x, 180))
+
+    p1.insert_text((55, 135), "Architecture", fontsize=9)
+    p1.insert_text((175, 135), "Parallelization", fontsize=9)
+    p1.insert_text((345, 135), "Context Window", fontsize=9)
+
+    p1.insert_text((55, 155), "Transformer", fontsize=9)
+    p1.insert_text((175, 155), "Fully Parallel", fontsize=9)
+    p1.insert_text((345, 155), "Global Attention", fontsize=9)
+
+    p1.insert_text((55, 175), "RNN", fontsize=9)
+    p1.insert_text((175, 175), "Sequential", fontsize=9)
+    p1.insert_text((345, 175), "Recurrent Hidden State", fontsize=9)
+
+    p1.insert_text((50, 210), "This architecture eliminates the sequential recurrence bottleneck.\n", fontsize=9)
+
+    # Rubric Table on Page 1: Header + Row 1 + Wrapped Row
+    for y in [240, 260, 290, 320]:
+        p1.draw_line((50, y), (540, y))
+    for x in [50, 170, 480, 540]:
+        p1.draw_line((x, 240), (x, 320))
+
+    p1.insert_text((55, 255), "Criterion", fontsize=9)
+    p1.insert_text((175, 255), "Description", fontsize=9)
+    p1.insert_text((485, 255), "Marks", fontsize=9)
+
+    p1.insert_text((55, 275), "Attention Mechanism", fontsize=9)
+    p1.insert_text((175, 275), "Computes scaled dot-product atten-\ntion weights", fontsize=9)
+    p1.insert_text((485, 275), "5.0", fontsize=9)
+
+    # Wrapped row inside tall cell (empty first and last columns)
+    p1.insert_text((175, 305), "and projects linear value representations.", fontsize=9)
+
+    p1.insert_text((250, 750), "Page 1 of 3", fontsize=9)
+
+    # Page 2: Rubric continuation row (NO repeated header!) + Q2 + start of Q2 Model Answer
+    p2 = doc.new_page()
+    for y in [50, 80]:
+        p2.draw_line((50, y), (540, y))
+    for x in [50, 170, 480, 540]:
+        p2.draw_line((x, 50), (x, 80))
+
+    p2.insert_text((55, 70), "Recurrent Contrast", fontsize=9)
+    p2.insert_text((175, 70), "Contrasts parallel attention with sequential recurrence.", fontsize=9)
+    p2.insert_text((485, 70), "5.0", fontsize=9)
+
+    p2.insert_text(
+        (50, 120),
+        "Question 2: Describe subword tokenization algorithms.\n"
+        "Model Answer: Subword tokenization balances vocabulary size and out-of-vocabulary handling.\n"
+        "Byte-Pair Encoding iteratively merges the most frequent byte pairs.\n",
+        fontsize=9
+    )
+    p2.insert_text((250, 750), "Page 2 of 3", fontsize=9)
+
+    # Page 3: Q2 Model Answer continuation (cross-page prose paragraph) + Q2 Rubric Table
+    p3 = doc.new_page()
+    p3.insert_text(
+        (50, 60),
+        "WordPiece and SentencePiece further optimize subword segmentation using likelihood objectives.\n",
+        fontsize=9
+    )
+
+    for y in [120, 150, 180]:
+        p3.draw_line((50, y), (540, y))
+    for x in [50, 170, 480, 540]:
+        p3.draw_line((x, 120), (x, 180))
+
+    p3.insert_text((55, 140), "Criterion", fontsize=9)
+    p3.insert_text((175, 140), "Description", fontsize=9)
+    p3.insert_text((485, 140), "Marks", fontsize=9)
+
+    p3.insert_text((55, 170), "Subword Tokenization", fontsize=9)
+    p3.insert_text((175, 170), "Explains frequency pair merging and subword vocabulary control.", fontsize=9)
+    p3.insert_text((485, 170), "5.0", fontsize=9)
+
+    p3.insert_text((250, 750), "Page 3 of 3", fontsize=9)
+
+    pdf_bytes = doc.write()
+
+    # 3. Test through POST /api/assessments/parse-document endpoint
+    response = client.post(
+        "/api/assessments/parse-document",
+        files={"file": ("NLP_Comprehensive_Assessment.pdf", pdf_bytes, "application/pdf")}
+    )
+    assert response.status_code == 200
+    data = response.json()
+
+    # Title & Overall marks
+    assert data["title"] == "Natural Language Processing Comprehensive Assessment"
+    assert data["total_marks"] == 15.0
+    assert len(data["questions"]) == 2  # Exactly 2 questions, 0 phantom questions
+
+    # Question 1 Verification
+    q1 = data["questions"][0]
+    assert q1["question_order"] == 1
+    assert "self-attention mechanism in Transformer models" in q1["question_text"]
+
+    # Model answer has comparison table and prose, but NO rubric content
+    assert "scaled dot-product similarity" in q1["model_answer"]
+    assert "For Architecture Transformer, Parallelization is Fully Parallel" in q1["model_answer"]
+    assert "For Architecture RNN, Parallelization is Sequential" in q1["model_answer"]
+    assert "eliminates the sequential recurrence bottleneck" in q1["model_answer"]
+    assert "Attention Mechanism" not in q1["model_answer"]
+    assert "Recurrent Contrast" not in q1["model_answer"]
+    assert "For Criterion" not in q1["model_answer"]
+
+    # Stitched Rubric Table for Question 1
+    assert len(q1["criteria"]) == 2
+    assert q1["criteria"][0]["name"] == "Attention Mechanism"
+    assert "atten-tion weights" in q1["criteria"][0]["description"]
+    assert "and projects linear value representations." in q1["criteria"][0]["description"]
+    assert q1["criteria"][0]["max_marks"] == 5.0
+
+    assert q1["criteria"][1]["name"] == "Recurrent Contrast"
+    assert "Contrasts parallel attention with sequential recurrence" in q1["criteria"][1]["description"]
+    assert q1["criteria"][1]["max_marks"] == 5.0
+    assert q1["max_marks"] == 10.0
+
+    # Question 2 Verification
+    q2 = data["questions"][1]
+    assert q2["question_order"] == 2
+    assert "subword tokenization algorithms" in q2["question_text"]
+
+    # Cross-page paragraph continuity in Model Answer
+    assert "Subword tokenization balances vocabulary size" in q2["model_answer"]
+    assert "Byte-Pair Encoding iteratively merges" in q2["model_answer"]
+    assert "WordPiece and SentencePiece further optimize subword segmentation" in q2["model_answer"]
+
+    # Rubric Criterion for Question 2
+    assert len(q2["criteria"]) == 1
+    assert q2["criteria"][0]["name"] == "Subword Tokenization"
+    assert "frequency pair merging" in q2["criteria"][0]["description"]
+    assert q2["criteria"][0]["max_marks"] == 5.0
+    assert q2["max_marks"] == 5.0
+
+
+def test_student_multipage_pdf_table_linearization():
+    """
+    Verifies that when a multi-page PDF student submission or reference material
+    containing a comparison table split across page breaks without repeated headers
+    is processed by TextExtractor.extract_from_file:
+    1. Cross-page data tables stitch seamlessly.
+    2. All rows from Page 1 and Page 2 are linearized using Page 1's column headers.
+    3. Multi-page pagination metadata ('total_pages', 'pages') is accurately preserved.
+    """
+    import fitz
+
+    doc = fitz.open()
+
+    # Page 1: Student intro and first half of comparison table
+    p1 = doc.new_page()
+    p1.insert_text((50, 40), "Question 1: Compare disk imaging types in digital forensics.\n", fontsize=9)
+
+    # Table on Page 1: 1 header row, 1 data row
+    for y in [80, 110, 140]:
+        p1.draw_line((50, y), (540, y))
+    for x in [50, 200, 370, 540]:
+        p1.draw_line((x, 80), (x, 140))
+
+    p1.insert_text((55, 100), "Image Type", fontsize=9)
+    p1.insert_text((205, 100), "Destination Drive", fontsize=9)
+    p1.insert_text((375, 100), "Verification", fontsize=9)
+
+    p1.insert_text((55, 130), "Forensic Duplicate", fontsize=9)
+    p1.insert_text((205, 130), "Raw Image", fontsize=9)
+    p1.insert_text((375, 130), "SHA256 Hash", fontsize=9)
+
+    p1.insert_text((250, 750), "Page 1 of 2", fontsize=9)
+
+    # Page 2: Continuation table rows without repeating column headers
+    p2 = doc.new_page()
+    for y in [50, 80, 110]:
+        p2.draw_line((50, y), (540, y))
+    for x in [50, 200, 370, 540]:
+        p2.draw_line((x, 50), (x, 110))
+
+    # Row 2 (continuation row on Page 2)
+    p2.insert_text((55, 70), "Restored Image", fontsize=9)
+    p2.insert_text((205, 70), "Physical Drive", fontsize=9)
+    p2.insert_text((375, 70), "Media Verification", fontsize=9)
+
+    # Row 3 (continuation row on Page 2)
+    p2.insert_text((55, 100), "Mirror Image", fontsize=9)
+    p2.insert_text((205, 100), "Bit-Stream Copy", fontsize=9)
+    p2.insert_text((375, 100), "Block Match", fontsize=9)
+
+    p2.insert_text((250, 750), "Page 2 of 2", fontsize=9)
+
+    pdf_bytes = doc.write()
+
+    # 1. Test TextExtractor.extract_from_file with bytes and filename
+    result = TextExtractor.extract_from_file(pdf_bytes, filename="student_submission.pdf")
+
+    assert result["total_pages"] == 2
+    assert len(result["pages"]) == 2
+
+    full_text = result["full_text"]
+    assert "Question 1: Compare disk imaging types in digital forensics." in full_text
+    assert "For Image Type Forensic Duplicate, Destination Drive is Raw Image, and Verification is SHA256 Hash." in full_text
+    assert "For Image Type Restored Image, Destination Drive is Physical Drive, and Verification is Media Verification." in full_text
+    assert "For Image Type Mirror Image, Destination Drive is Bit-Stream Copy, and Verification is Block Match." in full_text
+
+    # Verify tables metadata
+    assert len(result["tables"]) == 1
+    table_meta = result["tables"][0]
+    assert table_meta["headers"] == ["Image Type", "Destination Drive", "Verification"]
+    assert len(table_meta["rows"]) == 3
+    assert table_meta["rows"][0] == ["Forensic Duplicate", "Raw Image", "SHA256 Hash"]
+    assert table_meta["rows"][1] == ["Restored Image", "Physical Drive", "Media Verification"]
+    assert table_meta["rows"][2] == ["Mirror Image", "Bit-Stream Copy", "Block Match"]
+
+    # 2. Test TextExtractor.extract_linearized_text convenience helper
+    linearized_text = TextExtractor.extract_linearized_text(pdf_bytes, filename="student_submission.pdf")
+    assert linearized_text == full_text
+
+
+def test_multipage_model_answer_no_phantom_questions():
+    """
+    Verifies that when a question's Model Answer spans across multiple pages in a PDF:
+    1. Zero phantom questions are created across page breaks.
+    2. All paragraphs and comparison tables across pages are appended to the parent question's Model Answer.
+    3. Trailing questions and all their rubric criteria remain correctly grouped without scattering.
+    4. Total assessment marks accurately sum all criteria.
+    """
+    import fitz
+
+    doc = fitz.open()
+
+    # --- Page 1: Assessment Title, Question 1, Model Answer, Rubric Table (2 criteria = 20.0 marks) ---
+    p1 = doc.new_page()
+    p1.insert_text(
+        (50, 40),
+        "Assessment Title: Comprehensive Natural Language Processing Exam\n\n"
+        "Question 1: Explain volatile memory acquisition techniques in forensic computing.\n"
+        "Model Answer: Memory acquisition captures the state of active processes and kernel space.\n",
+        fontsize=9
+    )
+    for y in [120, 145, 170, 195]:
+        p1.draw_line((50, y), (540, y))
+    for x in [50, 180, 470, 540]:
+        p1.draw_line((x, 120), (x, 195))
+
+    p1.insert_text((55, 138), "Criterion", fontsize=9)
+    p1.insert_text((185, 138), "Description", fontsize=9)
+    p1.insert_text((480, 138), "Marks", fontsize=9)
+
+    p1.insert_text((55, 163), "Volatile Capture", fontsize=9)
+    p1.insert_text((185, 163), "Captures active process state and volatile kernel data.", fontsize=9)
+    p1.insert_text((480, 163), "10.0", fontsize=9)
+
+    p1.insert_text((55, 188), "Kernel Integrity", fontsize=9)
+    p1.insert_text((185, 188), "Validates kernel structures and active network sockets.", fontsize=9)
+    p1.insert_text((480, 188), "10.0", fontsize=9)
+
+    p1.insert_text((250, 750), "Page 1 of 5", fontsize=9)
+
+    # --- Page 2: Question 2 & Model Answer (Page 1 of Q2) ---
+    p2 = doc.new_page()
+    p2.insert_text(
+        (50, 40),
+        "Question 2: Explain subword tokenization algorithms used in language models.\n\n"
+        "Model Answer: Subword tokenization balances vocabulary size and out-of-vocabulary handling by segmenting rare words into frequent subword units.\n\n"
+        "Byte-Pair Encoding iteratively merges the most frequent pairs of adjacent characters into single tokens.\n",
+        fontsize=9
+    )
+    p2.insert_text((250, 750), "Page 2 of 5", fontsize=9)
+
+    # --- Page 3: Question 2 Continuation (Page 2 of Q2: Prose + Comparison Table) ---
+    p3 = doc.new_page()
+    p3.insert_text(
+        (50, 40),
+        "Question 2 (Continued)\n\n"
+        "WordPiece and SentencePiece further optimize subword segmentation using likelihood-based scoring criteria.\n",
+        fontsize=9
+    )
+    for y in [100, 125, 150, 175]:
+        p3.draw_line((50, y), (540, y))
+    for x in [50, 180, 360, 540]:
+        p3.draw_line((x, 100), (x, 175))
+
+    p3.insert_text((55, 118), "Method", fontsize=9)
+    p3.insert_text((185, 118), "Vocabulary", fontsize=9)
+    p3.insert_text((365, 118), "OOV Strategy", fontsize=9)
+
+    p3.insert_text((55, 143), "Word-Level", fontsize=9)
+    p3.insert_text((185, 143), "Unbounded", fontsize=9)
+    p3.insert_text((365, 143), "Special Unknown Token", fontsize=9)
+
+    p3.insert_text((55, 168), "Subword-BPE", fontsize=9)
+    p3.insert_text((185, 168), "Bounded", fontsize=9)
+    p3.insert_text((365, 168), "Character Fallback", fontsize=9)
+
+    p3.insert_text(
+        (50, 200),
+        "Subword segmentation ensures that vocabulary embeddings remain compact without losing lexical coverage.\n",
+        fontsize=9
+    )
+    p3.insert_text((250, 750), "Page 3 of 5", fontsize=9)
+
+    # --- Page 4: Question 2 Continuation (Page 3 of Q2: Prose + Rubric Table, 2 criteria = 20.0 marks) ---
+    p4 = doc.new_page()
+    p4.insert_text(
+        (50, 40),
+        "Question 2 Continued:\n\n"
+        "During tokenization, unknown words are broken down into known morphemes to preserve semantic representations.\n",
+        fontsize=9
+    )
+    for y in [100, 125, 150, 175]:
+        p4.draw_line((50, y), (540, y))
+    for x in [50, 150, 480, 540]:
+        p4.draw_line((x, 100), (x, 175))
+
+    p4.insert_text((55, 118), "Criterion", fontsize=9)
+    p4.insert_text((155, 118), "Description", fontsize=9)
+    p4.insert_text((490, 118), "Marks", fontsize=9)
+
+    p4.insert_text((55, 143), "Subword Tradeoff", fontsize=9)
+    p4.insert_text((155, 143), "Explains vocabulary compression versus OOV coverage.", fontsize=8)
+    p4.insert_text((490, 143), "10.0", fontsize=9)
+
+    p4.insert_text((55, 168), "Algorithm Comparison", fontsize=9)
+    p4.insert_text((155, 168), "Contrasts Word-Level and Subword BPE characteristics.", fontsize=8)
+    p4.insert_text((490, 168), "10.0", fontsize=9)
+
+    p4.insert_text((250, 750), "Page 4 of 5", fontsize=9)
+
+    # --- Page 5: Question 3 & Model Answer & Rubric Table (3 criteria = 20.0 marks) ---
+    p5 = doc.new_page()
+    p5.insert_text(
+        (50, 40),
+        "Question 3: Explain the self-attention mechanism and multi-head projection in Transformer architectures.\n\n"
+        "Model Answer: Scaled dot-product self-attention maps query and key matrices to attention weights and projects linear value representations.\n",
+        fontsize=9
+    )
+    for y in [120, 145, 170, 195, 220]:
+        p5.draw_line((50, y), (540, y))
+    for x in [50, 180, 470, 540]:
+        p5.draw_line((x, 120), (x, 220))
+
+    p5.insert_text((55, 138), "Criterion", fontsize=9)
+    p5.insert_text((185, 138), "Description", fontsize=9)
+    p5.insert_text((480, 138), "Marks", fontsize=9)
+
+    p5.insert_text((55, 163), "Attention Scoring", fontsize=9)
+    p5.insert_text((185, 163), "Computes query-key dot products scaled by square root of dimensionality.", fontsize=9)
+    p5.insert_text((480, 163), "10.0", fontsize=9)
+
+    p5.insert_text((55, 188), "Multi-Head Projection", fontsize=9)
+    p5.insert_text((185, 188), "Projects linear queries keys and values into distinct subspace heads.", fontsize=9)
+    p5.insert_text((480, 188), "5.0", fontsize=9)
+
+    p5.insert_text((55, 213), "Context Aggregation", fontsize=9)
+    p5.insert_text((185, 213), "Aggregates head outputs through final feed-forward linear projection.", fontsize=9)
+    p5.insert_text((480, 213), "5.0", fontsize=9)
+
+    p5.insert_text((250, 750), "Page 5 of 5", fontsize=9)
+
+    pdf_bytes = doc.write()
+
+    # Test through POST /api/assessments/parse-document
+    response = client.post(
+        "/api/assessments/parse-document",
+        files={"file": ("NLP_MultiPage_Comprehensive_Exam.pdf", pdf_bytes, "application/pdf")}
+    )
+    assert response.status_code == 200
+    parsed = response.json()
+
+    # 1. Exactly 3 questions (0 phantom questions created on page breaks)
+    assert len(parsed["questions"]) == 3
+    assert parsed["title"] == "Comprehensive Natural Language Processing Exam"
+
+    # 2. Total assessment marks equal 60.0
+    assert parsed["total_marks"] == 60.0
+
+    # 3. Question 1 validation
+    q1 = parsed["questions"][0]
+    assert q1["question_order"] == 1
+    assert "volatile memory acquisition" in q1["question_text"]
+    assert "Memory acquisition captures" in q1["model_answer"]
+    assert len(q1["criteria"]) == 2
+    assert q1["max_marks"] == 20.0
+
+    # 4. Question 2 validation: model answer spans across all 3 pages
+    q2 = parsed["questions"][1]
+    assert q2["question_order"] == 2
+    assert "subword tokenization algorithms" in q2["question_text"]
+    assert "Subword tokenization balances vocabulary size" in q2["model_answer"]
+    assert "Byte-Pair Encoding iteratively merges" in q2["model_answer"]
+    assert "WordPiece and SentencePiece further optimize" in q2["model_answer"]
+    assert "For Method Word-Level, Vocabulary is Unbounded, and OOV Strategy is Special Unknown Token." in q2["model_answer"]
+    assert "For Method Subword-BPE, Vocabulary is Bounded, and OOV Strategy is Character Fallback." in q2["model_answer"]
+    assert "During tokenization, unknown words are broken down into known morphemes" in q2["model_answer"]
+    assert len(q2["criteria"]) == 2
+    assert q2["max_marks"] == 20.0
+
+    # 5. Question 3 validation: retains all 3 of its rubric criteria (20.0 marks)
+    q3 = parsed["questions"][2]
+    assert q3["question_order"] == 3
+    assert "self-attention mechanism and multi-head projection" in q3["question_text"]
+    assert "Scaled dot-product self-attention" in q3["model_answer"]
+    assert len(q3["criteria"]) == 3
+    assert q3["criteria"][0]["name"] == "Attention Scoring"
+    assert q3["criteria"][0]["max_marks"] == 10.0
+    assert q3["criteria"][1]["name"] == "Multi-Head Projection"
+    assert q3["criteria"][1]["max_marks"] == 5.0
+    assert q3["criteria"][2]["name"] == "Context Aggregation"
+    assert q3["criteria"][2]["max_marks"] == 5.0
+    assert q3["max_marks"] == 20.0
+
+
+def test_markdown_table_with_math_cardinality_pipes():
+    """
+    Tests that pipe characters used in mathematical cardinality or norm expressions
+    (e.g., |G|, |w|, |V_D|) within markdown table cells are not mistaken for column separators.
+    """
+    md_text = """| Grammar Class | Complexity |
+| --- | --- |
+| CFG | O(|G| n^3) |
+| LR(k) | O(|V_D| + |w|) |"""
+
+    linearized = TableLinearizer.linearize_markdown_tables(md_text)
+    assert "For Grammar Class CFG, Complexity is O(|G| n^3)." in linearized
+    assert "For Grammar Class LR(k), Complexity is O(|V_D| + |w|)." in linearized
+
+    blocks = TableLinearizer.extract_document_blocks("test_table.txt", md_text.encode("utf-8"))
+    assert len(blocks) == 1
+    table_block = blocks[0]
+    assert table_block["type"] == "table"
+    assert table_block["headers"] == ["Grammar Class", "Complexity"]
+    assert len(table_block["rows"]) == 2
+    assert table_block["rows"][0] == ["CFG", "O(|G| n^3)"]
+    assert table_block["rows"][1] == ["LR(k)", "O(|V_D| + |w|)"]
 

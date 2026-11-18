@@ -461,3 +461,565 @@ def test_paraphrase_guards_and_off_topic_review_suppression():
     assert len(off_data["review_reasons"]) == 0
 
 
+def test_segmenter_rescues_unlabeled_interior_question():
+    """
+    Tests that when an interior question is completely unlabeled between explicit anchors
+    (e.g., Question 1: and Question 3:), Stage 3 fill empty rescues the semantic block sequence
+    belonging to the unlabeled question based on embedding cosine similarity.
+    """
+    questions = [
+        {
+            "id": "q1",
+            "question_order": 1,
+            "question_text": "Discuss regular expressions and finite automata theory.",
+            "model_answer": "Regular expressions specify languages recognized by deterministic and non-deterministic finite automata.",
+            "criteria": [{"name": "Automata", "description": "Finite automata properties.", "max_marks": 5.0}]
+        },
+        {
+            "id": "q2",
+            "question_order": 2,
+            "question_text": "Analyze context-free grammars and CYK parsing.",
+            "model_answer": "Context-free grammars use production rules with single nonterminals on the left. The CYK parsing algorithm evaluates Chomsky normal form grammars in cubic time.",
+            "criteria": [{"name": "CFG", "description": "Context free grammar and CYK.", "max_marks": 5.0}]
+        },
+        {
+            "id": "q3",
+            "question_order": 3,
+            "question_text": "Explain Turing machines and decidability.",
+            "model_answer": "Turing machines model universal computation with an infinite tape and read-write head. Decidability concerns halting problems.",
+            "criteria": [{"name": "TM", "description": "Turing computability and halting.", "max_marks": 5.0}]
+        }
+    ]
+
+    submission_text = """Question 1:
+Regular expressions define regular languages recognized by finite state automata.
+
+Deterministic and nondeterministic finite automata share equivalent computational power.
+
+Context-Free Grammars generate context-free languages beyond finite automata.
+They use production rules where the left-hand side is a single nonterminal.
+
+The CYK algorithm parses grammars transformed into Chomsky Normal Form.
+
+For Algorithm CYK, Grammar Form is CNF, and Complexity is O(n^3).
+
+Question 3:
+Turing machines model universal computation with an infinite tape and read-write head.
+The halting problem is undecidable for universal Turing machines."""
+
+    slices = AnswerSegmenter.segment_submission(submission_text, questions)
+    assert "q1" in slices and "q2" in slices and "q3" in slices
+    assert "finite state automata" in slices["q1"]
+    assert "Context-Free Grammars" in slices["q2"]
+    assert "CYK" in slices["q2"]
+    assert "Turing machines" in slices["q3"]
+    assert len(slices["q2"].strip()) > 0
+
+
+def test_compound_contrastive_propositions_awarded_full_credit():
+    """
+    Tests that a long compound contrastive proposition (e.g. len > 110 with 'whereas')
+    is split into atomic clauses so that a student entailing both clauses in separate sentences
+    receives full marks with 0 false-positive contradiction flags.
+    """
+    payload = {
+        "title": "Formal Language Closure Properties",
+        "question": "Discuss closure properties of context-free languages under standard operations.",
+        "model_answer": "Context-free languages are closed under union and concatenation operations, whereas they are not closed under set intersection or complementation.",
+        "total_marks": 10.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "Closure Contrast",
+                "description": "Context-free languages are closed under union and concatenation operations, whereas they are not closed under set intersection or complementation.",
+                "max_marks": 10.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    student_answer = (
+        "Context-free languages are closed under union and concatenation operations. "
+        "In contrast, they are not closed under set intersection or complementation."
+    )
+
+    res = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_answer,
+        "feedback_mode": "none"
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total_score"] >= 9.0, f"Expected high score, got {data['total_score']}"
+    assert len(data["criterion_breakdown"][0]["contradictions_detected"]) == 0
+    assert data["requires_teacher_review"] is False
+
+
+def test_linearized_table_propositions_isolated_from_unrelated_prose():
+    """
+    Tests that when a criterion includes linearized table propositions,
+    unrelated prose sentences in the student submission (even containing polarity inversion or negative words)
+    do not falsely contradict linearized table propositions for other entities.
+    """
+    payload = {
+        "title": "Grammar Family Equivalence",
+        "question": "Compare regular languages and context-free languages.",
+        "model_answer": (
+            "For Language Class Regular Languages, Closed Under Union is Yes, and Deterministic Variant Equivalent is Yes. "
+            "For Language Class Context-Free Languages, Closed Under Union is Yes, and Deterministic Variant Equivalent is No."
+        ),
+        "total_marks": 10.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "Equivalence Matrix",
+                "description": (
+                    "For Language Class Regular Languages, Closed Under Union is Yes, and Deterministic Variant Equivalent is Yes. "
+                    "For Language Class Context-Free Languages, Closed Under Union is Yes, and Deterministic Variant Equivalent is No."
+                ),
+                "max_marks": 10.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    student_submission = (
+        "For Language Class Regular Languages, Closed Under Union is Yes, and Deterministic Variant Equivalent is Yes.\n"
+        "For Language Class Context-Free Languages, Closed Under Union is Yes, and Deterministic Variant Equivalent is No.\n"
+        "Deterministic pushdown automata reject languages that general context-free grammars can generate."
+    )
+
+    res = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_submission,
+        "feedback_mode": "none"
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total_score"] >= 9.0, f"Expected full/high credit, got {data['total_score']}"
+    assert len(data["criterion_breakdown"][0]["contradictions_detected"]) == 0
+    assert data["requires_teacher_review"] is False
+
+
+def test_linearized_table_candidate_rows_isolated_from_prose_rubric_propositions():
+    """
+    Tests that when a student includes a comparison table in their submission
+    alongside prose, the linearized table rows for entity B (e.g., Context-Free Languages)
+    do not trigger false contradictions against prose rubric propositions for entity A
+    (e.g., "Regular languages are closed under union and concatenation operations.").
+    """
+    payload = {
+        "title": "Formal Language Foundations",
+        "question": "Explain the closure properties of regular languages.",
+        "model_answer": "Regular languages are closed under union and concatenation operations.",
+        "total_marks": 5.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "Regular Language Closure",
+                "description": "Regular languages are closed under union and concatenation operations.",
+                "max_marks": 5.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    # Student provides the correct prose answer for regular languages,
+    # but ALSO includes a comparison table for context-free languages in the same answer slice
+    student_text = (
+        "Regular languages are closed under union and concatenation operations.\n\n"
+        "| Language Class | Closed Under Intersection | Deterministic PDA Equivalent |\n"
+        "| --- | --- | --- |\n"
+        "| Context-Free Languages | No | No |"
+    )
+
+    res = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_text,
+        "feedback_mode": "none"
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total_score"] >= 4.5, f"Expected high score >= 4.5, got {data['total_score']}"
+    assert len(data["criterion_breakdown"][0]["contradictions_detected"]) == 0
+    assert data["requires_teacher_review"] is False
+
+
+def test_entity_scoped_semicolon_attribute_lists_preserve_subject():
+    """
+    Tests that rubric criteria structured as 'Entity: Key1: Val1; Key2: Val2.'
+    preserve the leading entity name across all attribute clauses without severing them
+    into orphan propositions.
+    """
+    # Test proposition extraction directly
+    criterion_desc = "CKY Algorithm: Chomsky Normal Form CFG; Time: O(|G| n^3); Space: O(|G| n^2)."
+    props = GradingEngine._extract_propositions(criterion_desc)
+    assert len(props) == 1
+    assert "CKY Algorithm" in props[0]
+    assert "Time: O(|G| n^3)" in props[0]
+    assert "Space: O(|G| n^2)" in props[0]
+
+    # Test full grading with comparison table
+    payload = {
+        "title": "Parsing Algorithms Evaluation",
+        "question": "Specify the grammar form, time complexity, and space complexity of the CKY algorithm.",
+        "model_answer": "CKY Algorithm: Chomsky Normal Form CFG; Time: O(|G| n^3); Space: O(|G| n^2).",
+        "total_marks": 5.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "CKY Specifications",
+                "description": "CKY Algorithm: Chomsky Normal Form CFG; Time: O(|G| n^3); Space: O(|G| n^2).",
+                "max_marks": 5.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    student_text = (
+        "| Algorithm | Grammar Form | Time Complexity | Space Complexity |\n"
+        "| --- | --- | --- | --- |\n"
+        "| CKY Algorithm | Chomsky Normal Form CFG | O(|G| n^3) | O(|G| n^2) |"
+    )
+
+    res = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_text,
+        "feedback_mode": "none"
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total_score"] >= 4.5, f"Expected high score >= 4.5, got {data['total_score']}"
+    assert len(data["criterion_breakdown"][0]["contradictions_detected"]) == 0
+    assert data["requires_teacher_review"] is False
+
+
+def test_affirmative_prose_elaborations_and_genuine_inversions():
+    """
+    Tests that:
+    1. A rich affirmative multi-concept sentence discussing DFA transitions and state properties
+       does not falsely contradict a sibling affirmative proposition about NFA transitions.
+    2. A genuine contradictory inversion (claiming DFAs have non-deterministic multiple transitions)
+       is caught as a contradiction with review required.
+    """
+    payload = {
+        "title": "Automata Equivalence and Determinism",
+        "question": "Explain determinism in finite automata and transition properties.",
+        "model_answer": "Deterministic finite automata have exactly one transition per symbol from each state. Non-deterministic finite automata can have multiple transitions or epsilon transitions.",
+        "total_marks": 10.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "DFA Determinism",
+                "description": "Deterministic finite automata have exactly one transition per symbol from each state.",
+                "max_marks": 5.0
+            },
+            {
+                "name": "NFA Non-Determinism",
+                "description": "Non-deterministic finite automata can have multiple transitions or epsilon transitions.",
+                "max_marks": 5.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    # 1. Affirmative multi-concept student answer (both sentences affirmative, explaining both concepts)
+    student_affirmative = (
+        "Deterministic finite automata have exactly one transition per symbol from each state, executing linearly. "
+        "Non-deterministic finite automata can have multiple transitions or epsilon transitions for a given input symbol."
+    )
+    res_aff = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_affirmative,
+        "feedback_mode": "none"
+    })
+    assert res_aff.status_code == 200
+    aff_data = res_aff.json()
+    assert aff_data["total_score"] >= 9.0, f"Expected full marks for affirmative elaboration, got {aff_data['total_score']}"
+    assert aff_data["requires_teacher_review"] is False
+    for cb in aff_data["criterion_breakdown"]:
+        assert len(cb["contradictions_detected"]) == 0
+
+    # 2. Genuine contradiction: student directly inverts DFA determinism
+    student_inverted = (
+        "Deterministic finite automata have multiple possible transitions for the same symbol from each state. "
+        "Non-deterministic finite automata can have multiple transitions or epsilon transitions."
+    )
+    res_inv = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_inverted,
+        "feedback_mode": "none"
+    })
+    assert res_inv.status_code == 200
+    inv_data = res_inv.json()
+    dfa_crit = [cb for cb in inv_data["criterion_breakdown"] if cb["criterion_name"] == "DFA Determinism"][0]
+    assert len(dfa_crit["contradictions_detected"]) > 0 or dfa_crit["awarded_marks"] <= 1.0
+    assert inv_data["requires_teacher_review"] is True
+
+
+def test_colon_semicolon_entity_extraction_and_prose_isolation():
+    """
+    Tests that:
+    1. _extract_linearized_subject extracts ("Entity", "<EntityName>") from "<EntityName>: <Attr1>: <Val1>; <Attr2>: <Val2>."
+    2. In grading, an entity-scoped rubric proposition in this format is isolated from unrelated
+       prose sentences containing negative/incompatibility words (e.g., "cannot", "without").
+    """
+    spec_text = "CKY Algorithm: Chomsky Normal Form CFG; Time: O(|G| n^3); Space: O(|G| n^2)."
+    extracted = GradingEngine._extract_linearized_subject(spec_text)
+    assert extracted == ("Entity", "CKY Algorithm")
+
+    payload = {
+        "title": "Parsing Algorithms Benchmark",
+        "question": "Describe the requirements and complexities of CKY parsing.",
+        "model_answer": "CKY Algorithm: Chomsky Normal Form CFG; Time: O(|G| n^3); Space: O(|G| n^2).",
+        "total_marks": 5.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "CKY Specifications",
+                "description": "CKY Algorithm: Chomsky Normal Form CFG; Time: O(|G| n^3); Space: O(|G| n^2).",
+                "max_marks": 5.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    # Student describes CKY Algorithm in prose, but ALSO adds unrelated prose discussing limitations of PDAs
+    student_submission = (
+        "CKY Algorithm operates on Chomsky Normal Form CFG, running in time O(|G| n^3) and space O(|G| n^2).\n\n"
+        "Deterministic pushdown automata cannot parse general context-free languages without non-deterministic branching."
+    )
+
+    res = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_submission,
+        "feedback_mode": "none"
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total_score"] >= 4.5, f"Expected high score >= 4.5, got {data['total_score']}"
+    assert len(data["criterion_breakdown"][0]["contradictions_detected"]) == 0
+    assert data["requires_teacher_review"] is False
+
+
+def test_same_polarity_paraphrase_not_contradicted_by_lexical_bias():
+    """
+    Tests that near-verbatim same-polarity paraphrases containing negative-sentiment adjectives
+    (e.g., "useless rules" vs. "unreachable rules") are recognized as supporting paraphrases
+    and not falsely penalized as contradictions by DeBERTa lexical bias.
+    """
+    payload = {
+        "title": "Grammar Simplification",
+        "question": "Explain CFG simplification procedures.",
+        "model_answer": "CFG simplification eliminates unreachable rules to produce an equivalent reduced grammar.",
+        "total_marks": 5.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "Grammar Reduction",
+                "description": "CFG simplification eliminates unreachable rules to produce an equivalent reduced grammar.",
+                "max_marks": 5.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    # Student uses "useless rules" instead of "unreachable rules" (both sentences affirmative, 0 negation markers)
+    student_text = "CFG simplification removes useless rules to produce an equivalent reduced grammar."
+
+    res = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_text,
+        "feedback_mode": "none"
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total_score"] >= 4.5, f"Expected paraphrase >= 4.5, got {data['total_score']}"
+    assert len(data["criterion_breakdown"][0]["contradictions_detected"]) == 0
+    assert data["requires_teacher_review"] is False
+
+
+def test_skipped_interior_question_preserves_labeled_host_question():
+    """
+    Tests that when Question 1: and Question 3: are explicitly labeled and Question 2 is intentionally
+    omitted by the student (no Q2 content anywhere in the submission), Stage 3 does not drain or split
+    Question 1's slice: Question 1 keeps 100% of its content and Question 2 remains empty ("").
+    """
+    questions = [
+        {
+            "id": "q1",
+            "question_order": 1,
+            "question_text": "Discuss regular expressions and finite automata theory.",
+            "model_answer": "Regular expressions specify languages recognized by deterministic and non-deterministic finite automata.",
+            "criteria": [{"name": "Automata", "description": "Finite automata properties.", "max_marks": 5.0}]
+        },
+        {
+            "id": "q2",
+            "question_order": 2,
+            "question_text": "Analyze context-free grammars and CYK parsing.",
+            "model_answer": "Context-free grammars use production rules with single nonterminals on the left. The CYK parsing algorithm evaluates Chomsky normal form grammars in cubic time.",
+            "criteria": [{"name": "CFG", "description": "Context free grammar and CYK.", "max_marks": 5.0}]
+        },
+        {
+            "id": "q3",
+            "question_order": 3,
+            "question_text": "Explain Turing machines and decidability.",
+            "model_answer": "Turing machines model universal computation with an infinite tape and read-write head. Decidability concerns halting problems.",
+            "criteria": [{"name": "TM", "description": "Turing computability and halting.", "max_marks": 5.0}]
+        }
+    ]
+
+    # Student explicitly answers Q1 (with multiple paragraphs) and Q3, intentionally omitting Q2
+    submission_text = """Question 1:
+Regular expressions define regular languages recognized by finite state automata.
+
+Deterministic and nondeterministic finite automata share equivalent computational power.
+
+Finite state machines maintain a fixed finite set of internal control states.
+
+Pumping lemma for regular languages establishes minimum repetition lengths for loops.
+
+Question 3:
+Turing machines model universal computation with an infinite tape and read-write head.
+The halting problem is undecidable for universal Turing machines."""
+
+    slices = AnswerSegmenter.segment_submission(submission_text, questions)
+    assert "q1" in slices and "q2" in slices and "q3" in slices
+
+    # Q1 retains all 4 paragraphs
+    assert "finite state automata" in slices["q1"]
+    assert "equivalent computational power" in slices["q1"]
+    assert "Pumping lemma" in slices["q1"]
+
+    # Q2 is completely empty (intentionally omitted)
+    assert slices["q2"].strip() == ""
+
+    # Q3 retains its content
+    assert "Turing machines" in slices["q3"]
+    assert "undecidable" in slices["q3"]
+
+
+def test_txt_inline_q1_followed_by_q3_preserves_q1_and_leaves_q2_empty():
+    """
+    Tests that a .txt submission where Question 1: is immediately followed by a paragraph
+    (no blank line) and followed later by Question 3: (with Q2 skipped):
+    1. Assigns Question 1's text to q1.
+    2. Leaves q2 completely empty ("").
+    3. Assigns Question 3's text to q3.
+    """
+    questions = [
+        {
+            "id": "q1",
+            "question_order": 1,
+            "question_text": "Explain formal language theory and Chomsky hierarchy.",
+            "model_answer": "Formal language theory categorizes languages according to the Chomsky hierarchy.",
+            "criteria": [{"name": "Language Theory", "description": "Chomsky hierarchy concepts.", "max_marks": 5.0}]
+        },
+        {
+            "id": "q2",
+            "question_order": 2,
+            "question_text": "Discuss context-free grammars and pushdown automata.",
+            "model_answer": "Context-free grammars are recognized by pushdown automata using a stack.",
+            "criteria": [{"name": "CFG and PDA", "description": "Stack automata and CFGs.", "max_marks": 5.0}]
+        },
+        {
+            "id": "q3",
+            "question_order": 3,
+            "question_text": "Describe Turing machine computability.",
+            "model_answer": "Turing machines model universal computation with an infinite tape and read-write head.",
+            "criteria": [{"name": "Computability", "description": "Turing machines and halting.", "max_marks": 5.0}]
+        }
+    ]
+
+    # Notice: Question 1: has no blank line before the paragraph (inline on next line)
+    raw_txt_submission = (
+        "Question 1:\n"
+        "Formal language theory is a branch of theoretical computer science that focuses on the syntactic "
+        "and mathematical aspects of formal languages. It categorizes languages according to the Chomsky "
+        "hierarchy into regular, context-free, context-sensitive, and recursively enumerable languages.\n\n"
+        "Question 3:\n"
+        "Turing machines model universal computation with an infinite tape and read-write head. "
+        "The halting problem is undecidable for universal Turing machines."
+    )
+
+    slices = AnswerSegmenter.segment_submission(raw_txt_submission, questions)
+    assert "q1" in slices and "q2" in slices and "q3" in slices
+    assert "Formal language theory" in slices["q1"]
+    assert "Chomsky hierarchy" in slices["q1"]
+    assert slices["q2"].strip() == ""
+    assert "Turing machines" in slices["q3"]
+    assert "halting problem" in slices["q3"]
+
+
+def test_motivational_and_scope_boundary_clauses_no_false_contradiction():
+    """
+    Tests that explanatory sentences starting with motivational/purpose prepositions
+    ("To prevent zero probabilities...") or scope-boundary phrases ("Beyond regular languages lies...")
+    do not trigger false Reverse NLI contradictions against base definition propositions.
+    """
+    payload = {
+        "title": "Language Models and Automata Boundaries",
+        "question": "Explain statistical language models and finite state boundaries.",
+        "model_answer": "Statistical language models decompose sentence probability using the chain rule and n-gram Markov assumptions. Regular expressions denote regular languages recognized by deterministic finite automata.",
+        "total_marks": 10.0,
+        "doc_scope": "ALL",
+        "criteria": [
+            {
+                "name": "N-gram Modeling",
+                "description": "Statistical language models decompose sentence probability using the chain rule and n-gram Markov assumptions.",
+                "max_marks": 5.0
+            },
+            {
+                "name": "Regular Languages",
+                "description": "Regular expressions denote regular languages recognized by deterministic finite automata.",
+                "max_marks": 5.0
+            }
+        ]
+    }
+
+    create_res = client.post("/assessments", json=payload)
+    assert create_res.status_code == 201
+    assessment = create_res.json()
+
+    # Student includes motivational sentence with "zero" and scope-boundary sentence with "beyond"
+    student_text = (
+        "Statistical language models decompose sentence probabilities using chain rule and n-gram Markov assumptions. "
+        "To prevent zero probabilities on unseen n-grams, smoothing techniques such as Good-Turing or Kneser-Ney are applied. "
+        "Regular expressions denote regular languages recognized by deterministic finite automata. "
+        "Beyond regular languages lies the class of context-free languages recognized by pushdown automata."
+    )
+
+    res = client.post("/grading/grade-text", json={
+        "assessment_id": assessment["id"],
+        "student_text": student_text,
+        "feedback_mode": "none"
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total_score"] >= 9.0, f"Expected high score >= 9.0, got {data['total_score']}"
+    assert data["requires_teacher_review"] is False
+    for cb in data["criterion_breakdown"]:
+        assert len(cb["contradictions_detected"]) == 0, f"Unexpected contradiction in {cb['criterion_name']}: {cb['contradictions_detected']}"
+
+

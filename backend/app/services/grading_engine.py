@@ -29,11 +29,25 @@ from backend.app.services.table_linearizer import TableLinearizer
 class GradingEngine:
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
-        """Splits text into meaningful sentences."""
+        """Splits text into meaningful sentences on sentence boundaries (. ! ?) and semicolons (;)."""
         if not text:
             return []
-        raw_sents = re.split(r'(?<=[.!?])\s+', text.strip())
-        cleaned = [s.strip() for s in raw_sents if len(s.strip()) > 5]
+        primary_sents = re.split(r'(?:(?<=[.!?])\s+|\n+)', text.strip())
+        cleaned: List[str] = []
+        entity_attr_pattern = re.compile(r'^(?:(?:\d+[\.\)]|[-*•])\s*)?[^:;]{2,60}:\s+[^;]+;\s+[^:;]{2,50}:')
+        for s in primary_sents:
+            s_clean = s.strip()
+            if not s_clean:
+                continue
+            if entity_attr_pattern.match(s_clean):
+                if len(s_clean) > 5:
+                    cleaned.append(s_clean)
+            else:
+                parts = re.split(r';\s+', s_clean)
+                for p in parts:
+                    p_clean = p.strip()
+                    if len(p_clean) > 5:
+                        cleaned.append(p_clean)
         return cleaned if cleaned else [text.strip()]
 
     @staticmethod
@@ -254,7 +268,28 @@ class GradingEngine:
         """
         criterion_description = TableLinearizer.linearize_markdown_tables(criterion_description or "")
         raw_sents = cls._split_sentences(criterion_description)
-        substantive = [s for s in raw_sents if not cls._is_administrative_sentence(s)]
+
+        # Atomic Contrastive Clause Splitting:
+        # Split long compound contrastive sentences (len > 100) at `,\s+(?:whereas|while|but)\s+`
+        # provided both resulting clauses have >= 25 characters and a finite verb.
+        finite_verb_pattern = re.compile(
+            r'\b(?:is|are|was|were|has|have|had|do|does|did|can|could|will|would|may|might|must|should|[a-z]{3,}(?:ed|es|s))\b',
+            re.IGNORECASE
+        )
+        split_contrast_sents = []
+        for s in raw_sents:
+            if len(s) > 100:
+                m_contrast = re.search(r',\s+(?:whereas|while|but)\s+', s, re.IGNORECASE)
+                if m_contrast:
+                    c1 = s[:m_contrast.start()].strip().rstrip('.,;')
+                    c2 = s[m_contrast.end():].strip().rstrip('.,;')
+                    if len(c1) >= 25 and len(c2) >= 25:
+                        if finite_verb_pattern.search(c1) and finite_verb_pattern.search(c2):
+                            split_contrast_sents.extend([c1, c2])
+                            continue
+            split_contrast_sents.append(s)
+
+        substantive = [s for s in split_contrast_sents if not cls._is_administrative_sentence(s)]
 
         # Split compound clauses on coordinating predicate verbs or phrases (e.g. "...and recognizes it as...", "...and alternative to...")
         expanded_sents = []
@@ -466,10 +501,23 @@ class GradingEngine:
         """
         Matches linearized table sentences following:
         ^For <Header> <Entity>, <Col2> is <Val2>...
+        or colon-semicolon entity attribute specifications:
+        ^EntityName: Attr1: Val1; Attr2: Val2...
         Returns (normalized_header, normalized_entity) if matched, else None.
         """
         if not text:
             return None
+
+        # Check entity-scoped colon-semicolon attribute specification:
+        # e.g. "CKY Algorithm: Chomsky Normal Form CFG; Time: O(|G| n^3); Space: O(|G| n^2)."
+        # or "1. CKY Algorithm: Grammar: CNF; Time: O(|G| n^3); Space: O(|G| n^2)."
+        m_entity = re.match(r'^(?:(?:\d+[\.\)]|[-*•])\s*)?([^:;]{2,60}):\s+[^;]+;\s+[^:;]{2,50}:', text.strip())
+        if m_entity:
+            entity_name = m_entity.group(1).strip()
+            entity_name = re.sub(r'^[\s\W_]+', '', entity_name).strip()
+            if entity_name:
+                return ("Entity", entity_name)
+
         clean_text = re.sub(r'^[\s\W_]+', '', text or '').strip()
         m = re.match(r'(?i)^For\s+([^,]+),\s*(.+)$', clean_text)
         if not m:
@@ -729,6 +777,14 @@ class GradingEngine:
                 known_table_headers.add(extracted_subj[0])
                 all_table_entities.add(extracted_subj[1])
 
+        for s in student_sentences:
+            s_subj = cls._extract_linearized_subject(s)
+            if s_subj:
+                known_table_headers.add(s_subj[0])
+                all_table_entities.add(s_subj[1])
+
+        slice_has_table_rows = any(cls._extract_linearized_subject(s, known_table_headers) is not None for s in student_sentences)
+
         for prop_idx, prop in enumerate(target_propositions):
             prop_subj = cls._extract_linearized_subject(prop, known_table_headers)
             prop_emb = target_prop_embs[prop_idx] if target_prop_embs is not None else ModelsLoader.encode_texts([prop])[0]
@@ -823,14 +879,23 @@ class GradingEngine:
                 if not cls._is_conceptually_related(s_text, prop, s_sim, distinctive_prop_tokens, prop_tokens):
                     continue
 
-                # Linearized Table Subject-Entity Isolation Guard
+                # Symmetric Table-vs-Prose Contradiction Isolation Guard
+                s_subj = cls._extract_linearized_subject(s_text, known_table_headers)
                 if prop_subj is not None:
-                    s_subj = cls._extract_linearized_subject(s_text, known_table_headers)
+                    # Case B: Rubric proposition is a linearized table row or entity specification
                     if s_subj is not None:
-                        if s_subj[0] == prop_subj[0] and s_subj[1] != prop_subj[1]:
+                        if s_subj[1].lower() != prop_subj[1].lower():
                             continue
-                    elif cls._is_sibling_table_entity_candidate(s_text, prop_subj[1], all_table_entities):
-                        continue
+                    else:
+                        if prop_subj[1].lower() not in s_text.lower():
+                            continue
+                else:
+                    # Case A: Rubric proposition is prose (prop_subj is None)
+                    if s_subj is not None:
+                        # Candidate is a linearized table row or entity specification.
+                        # Skip contradiction unless prop explicitly mentions the table row's subject entity
+                        if s_subj[1].lower() not in prop.lower():
+                            continue
 
                 s_emb = cand_embs[s_idx] if s_idx < len(cand_embs) else ModelsLoader.encode_texts([s_text])[0]
 
@@ -884,7 +949,7 @@ class GradingEngine:
                     unique_contra_candidates.append((c_idx, c_text))
             unique_contra_candidates = unique_contra_candidates[:10]
 
-            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike|but)\b', prop) if len(cl.strip()) > 8]
             for _, c_text in unique_contra_candidates:
                 fwd_pairs_to_batch.append((c_text, prop))
                 if len(contrast_clauses) >= 2:
@@ -1111,14 +1176,17 @@ class GradingEngine:
             if is_concept_grounded and (ent_score >= 0.55 or best_fwd_ent >= 0.65):
                 verify_cand = best_ent_cand or best_cand
                 if verify_cand:
-                    # Linearized Table Subject-Entity Isolation Guard
+                    # Symmetric Table-vs-Prose Contradiction Isolation Guard
                     is_sibling_table_cand = False
+                    v_subj = cls._extract_linearized_subject(verify_cand, known_table_headers)
                     if prop_subj is not None:
-                        v_subj = cls._extract_linearized_subject(verify_cand, known_table_headers)
                         if v_subj is not None:
-                            if v_subj[0] == prop_subj[0] and v_subj[1] != prop_subj[1]:
+                            if v_subj[1].lower() != prop_subj[1].lower():
                                 is_sibling_table_cand = True
-                        elif cls._is_sibling_table_entity_candidate(verify_cand, prop_subj[1], all_table_entities):
+                        elif prop_subj[1].lower() not in verify_cand.lower():
+                            is_sibling_table_cand = True
+                    else:
+                        if v_subj is not None and v_subj[1].lower() not in prop.lower():
                             is_sibling_table_cand = True
 
                     if is_sibling_table_cand:
@@ -1130,14 +1198,14 @@ class GradingEngine:
                         sib_exclusive = sib_tokens - q_tokens - prop_tokens
                         is_swapped_entity = bool(v_tokens & sib_exclusive) and not bool(v_tokens & p_exclusive) if (sib_exclusive and p_exclusive) else False
 
+                        cand_fwd_r = cand_prop_nli.get(best_ent_cand_idx) if best_ent_cand_idx is not None else None
+                        if cand_fwd_r is None:
+                            cand_fwd_r = ModelsLoader.predict_nli([(verify_cand, prop)])[0]
+                        cand_fwd_ent = cand_fwd_r["entailment"]
+                        cand_fwd_contra = cand_fwd_r["contradiction"]
+
                         rev_check = ModelsLoader.predict_nli([(prop, verify_cand)])[0]
                         if (rev_check["contradiction"] >= 0.60 or (is_swapped_entity and rev_check["contradiction"] >= 0.40)) and rev_check["contradiction"] > rev_check["entailment"]:
-                            cand_fwd_r = cand_prop_nli.get(best_ent_cand_idx) if best_ent_cand_idx is not None else None
-                            if cand_fwd_r is None:
-                                cand_fwd_r = ModelsLoader.predict_nli([(verify_cand, prop)])[0]
-                            cand_fwd_ent = cand_fwd_r["entailment"]
-                            cand_fwd_contra = cand_fwd_r["contradiction"]
-
                             # Guard A: Conditional / Contrapositive Framing Guard
                             has_conditional = bool(re.search(r'(?i)\b(without|unless|absent|if\s+not)\b', verify_cand))
                             dist_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
@@ -1145,7 +1213,7 @@ class GradingEngine:
                             is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and cand_fwd_contra < 0.35
 
                             # Guard B: Multi-Clause Contrastive Proposition Guard
-                            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+                            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike|but)\b', prop) if len(cl.strip()) > 8]
                             is_contrast_subclause_entailed = False
                             if len(contrast_clauses) >= 2:
                                 for cl in contrast_clauses:
@@ -1167,7 +1235,42 @@ class GradingEngine:
                             if is_contrapositive:
                                 has_polarity_inversion = False
 
-                            if is_contrapositive or is_contrast_subclause_entailed or ((best_fwd_ent >= 0.62 or cand_fwd_ent >= 0.62 or ent_score >= 0.62) and cand_fwd_contra < 0.25 and not has_polarity_inversion):
+                            # Same-Polarity Paraphrase Guard in verify_cand:
+                            # If candidate and proposition have identical negation polarity and high alignment
+                            # (fwd_ent >= 0.55 or cosine_sim >= 0.70) without polarity inversion,
+                            # do not allow Reverse NLI over-prediction to override forward entailment.
+                            neg_marker_pattern = re.compile(
+                                r'(?i)\b(?:not|never|no|none|neither|nor|cannot|can\'t|won\'t|don\'t|doesn\'t|didn\'t|isn\'t|aren\'t|wasn\'t|weren\'t|without|impossible|false|incorrect|wrong|invalid|undecidable|uncomputable|intractable)\b'
+                            )
+                            v_neg_count = len(neg_marker_pattern.findall(verify_cand))
+                            prop_neg_count = len(neg_marker_pattern.findall(prop))
+                            v_same_polarity = (v_neg_count == prop_neg_count)
+                            v_high_alignment = (best_fwd_ent >= 0.55 or cand_fwd_ent >= 0.55 or ent_score >= 0.55 or (best_ent_sim is not None and best_ent_sim >= 0.70))
+                            is_same_polarity_paraphrase = (
+                                v_same_polarity
+                                and v_high_alignment
+                                and not has_polarity_inversion
+                                and cand_fwd_contra < 0.35
+                            )
+
+                            # Guard D: Motivational / Scope-Boundary Clause Guard in verify_cand
+                            is_v_motivational = bool(re.search(
+                                r'(?i)^\s*(?:to\s+(?:prevent|avoid|overcome|address|handle|resolve|ensure|solve)|beyond\s+|unlike\s+|in\s+contrast\s+to\s+)',
+                                verify_cand
+                            ))
+                            has_v_direct_neg = bool(re.search(
+                                r'(?i)\b(?:is\s+not|are\s+not|cannot|can\'t|never)\b',
+                                verify_cand
+                            ))
+                            is_v_motivational_guard = (
+                                prop_subj is None
+                                and v_subj is None
+                                and is_v_motivational
+                                and not has_v_direct_neg
+                                and not (rev_check["contradiction"] >= 0.85 and cand_fwd_ent < 0.08)
+                            )
+
+                            if is_contrapositive or is_contrast_subclause_entailed or is_same_polarity_paraphrase or is_v_motivational_guard or ((best_fwd_ent >= 0.62 or cand_fwd_ent >= 0.62 or ent_score >= 0.62) and cand_fwd_contra < 0.25 and not has_polarity_inversion):
                                 is_prop_demonstrated = True
                             else:
                                 is_contradiction = True
@@ -1193,14 +1296,23 @@ class GradingEngine:
                     if not cls._is_conceptually_related(c_text, prop, c_sim, distinctive_prop_tokens, prop_tokens):
                         continue
 
-                    # Linearized Table Subject-Entity Isolation Guard
+                    # Symmetric Table-vs-Prose Contradiction Isolation Guard
+                    c_subj = cls._extract_linearized_subject(c_text, known_table_headers)
                     if prop_subj is not None:
-                        c_subj = cls._extract_linearized_subject(c_text, known_table_headers)
+                        # Case B: Rubric proposition is a linearized table row or entity specification
                         if c_subj is not None:
-                            if c_subj[0] == prop_subj[0] and c_subj[1] != prop_subj[1]:
+                            if c_subj[1].lower() != prop_subj[1].lower():
                                 continue
-                        elif cls._is_sibling_table_entity_candidate(c_text, prop_subj[1], all_table_entities):
-                            continue
+                        else:
+                            if prop_subj[1].lower() not in c_text.lower():
+                                continue
+                    else:
+                        # Case A: Rubric proposition is prose (prop_subj is None)
+                        if c_subj is not None:
+                            # Candidate is a linearized table row or entity specification.
+                            # Skip contradiction unless prop explicitly mentions the table row's subject entity
+                            if c_subj[1].lower() not in prop.lower():
+                                continue
 
                     # Intra-Criterion Cross-Proposition Affinity Guard (Rule 2B)
                     c_tokens = cls._extract_content_tokens(c_text)
@@ -1279,6 +1391,79 @@ class GradingEngine:
                     if (is_proportional or bool(enum_items)) and not is_explicit_neg:
                         continue
 
+                    # Same-Polarity Paraphrase Guard:
+                    # If c_text and prop have the exact same negation polarity (both have 0 explicit negation
+                    # markers, or both have the same negation count) AND high semantic/lexical alignment
+                    # (cosine_sim >= 0.70 or fwd_ent >= 0.55), treat c_text as supporting/paraphrasing prop
+                    # and do not flag c_text as a contradiction.
+                    neg_marker_pattern = re.compile(
+                        r'(?i)\b(?:not|never|no|none|neither|nor|cannot|can\'t|won\'t|don\'t|doesn\'t|didn\'t|isn\'t|aren\'t|wasn\'t|weren\'t|without|impossible|false|incorrect|wrong|invalid|undecidable|uncomputable|intractable)\b'
+                    )
+                    c_neg_count = len(neg_marker_pattern.findall(c_text))
+                    prop_neg_count = len(neg_marker_pattern.findall(prop))
+                    same_negation_polarity = (c_neg_count == prop_neg_count)
+                    has_high_alignment = (c_sim is not None and c_sim >= 0.70) or (c_ent >= 0.55)
+                    has_c_polarity_inversion = bool(re.search(
+                        r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|same\s+key|ignore|reject|pull[\s-]+power|unplug)\b',
+                        c_text
+                    ))
+                    if same_negation_polarity and has_high_alignment and not has_c_polarity_inversion and c_contra < 0.35:
+                        continue
+
+                    # Entailment Preemption Guard:
+                    # When a proposition is already strongly entailed by a student statement,
+                    # do not allow a different sentence in the slice to flag a false contradiction.
+                    # Lower preemption threshold from 0.68 to 0.56 when entailing sentence has
+                    # same negation polarity as prop.
+                    best_entailment = max(best_fwd_ent, ent_score)
+                    ent_neg_count = len(neg_marker_pattern.findall(best_ent_cand)) if best_ent_cand else -1
+                    ent_same_polarity = (ent_neg_count == prop_neg_count)
+                    preemption_thresh = 0.56 if ent_same_polarity else 0.68
+
+                    if best_entailment >= preemption_thresh and best_ent_cand and (c_text.strip() not in best_ent_cand and best_ent_cand.strip() not in c_text):
+                        if prop_subj is not None:
+                            if c_subj is None or c_subj[1].lower() != prop_subj[1].lower() or not is_explicit_neg:
+                                continue
+                        else:
+                            if not (is_explicit_neg and c_contra >= 0.75 and c_contra > c_ent and c_ent < 0.15):
+                                continue
+
+                    # Strengthen Affirmative-vs-Affirmative Contradiction Guard on Prose Propositions:
+                    # When prop_subj is None (prose proposition) and c_subj is None (prose candidate):
+                    # Check whether c_text or prop contains an explicit negation or incompatibility cue.
+                    # If neither contains any cue (both are purely affirmative statements), require a very
+                    # strict NLI threshold (c_contra >= 0.88 and c_ent < 0.08) AND significant subject-noun
+                    # overlap before flagging a contradiction.
+                    incompat_cue_pattern = r'(?i)\b(?:not|never|no|none|neither|nor|cannot|can\'t|won\'t|don\'t|doesn\'t|didn\'t|isn\'t|aren\'t|wasn\'t|weren\'t|without|impossible|false|incorrect|wrong|invalid|undecidable|uncomputable|intractable|non-regular|non-context-free)\b'
+                    has_incompat_cue = bool(re.search(incompat_cue_pattern, c_text) or re.search(incompat_cue_pattern, prop))
+                    if prop_subj is None and c_subj is None and not has_incompat_cue:
+                        target_prop_toks = distinctive_prop_tokens if distinctive_prop_tokens else prop_tokens
+                        base_overlap = {re.sub(r'(?:ing|ed|es|s)$', '', t) for t in (c_tokens & target_prop_toks)}
+                        has_sig_overlap = len(base_overlap) >= 2 or (len(base_overlap) >= 1 and len(target_prop_toks) <= 2)
+                        if not (c_contra >= 0.88 and c_ent < 0.08 and has_sig_overlap):
+                            continue
+
+                    # Guard D: Motivational / Scope-Boundary Clause Guard:
+                    # Explanatory sentences starting with purpose or boundary prepositions
+                    # (e.g. "To prevent zero probabilities...", "Beyond regular languages lies...")
+                    # do not contradict general base definitions unless they directly negate the core predicate
+                    # with "is not", "are not", "cannot", "never" and exhibit extreme Reverse NLI contradiction
+                    # (rev_contra >= 0.85 and c_ent < 0.08).
+                    is_c_motivational = bool(re.search(
+                        r'(?i)^\s*(?:to\s+(?:prevent|avoid|overcome|address|handle|resolve|ensure|solve)|beyond\s+|unlike\s+|in\s+contrast\s+to\s+)',
+                        c_text
+                    ))
+                    has_c_direct_neg = bool(re.search(
+                        r'(?i)\b(?:is\s+not|are\s+not|cannot|can\'t|never)\b',
+                        c_text
+                    ))
+                    is_motivational_boundary_cand = (
+                        prop_subj is None
+                        and c_subj is None
+                        and is_c_motivational
+                        and not has_c_direct_neg
+                    )
+
                     # Entailment Protection: If student successfully and unambiguously entails prop
                     # in their submission (ent_score >= 0.55 with conceptual grounding),
                     # that proposition is DEMONSTRATED. An affirmative sentence elsewhere in a multi-sentence
@@ -1287,7 +1472,9 @@ class GradingEngine:
                     if is_prop_demonstrated:
                         if is_explicit_neg and c_contra >= 0.75 and c_contra > c_ent and c_ent < 0.15:
                             rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
-                            if rev_nli["contradiction"] >= 0.35:
+                            if is_motivational_boundary_cand and not (rev_nli["contradiction"] >= 0.85 and c_ent < 0.08):
+                                pass
+                            elif rev_nli["contradiction"] >= 0.35:
                                 is_contradiction = True
                                 cand = c_text
                                 contradictions_found.append(
@@ -1307,7 +1494,7 @@ class GradingEngine:
                             is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and c_contra < 0.35
 
                             # Guard B: Multi-Clause Contrastive Proposition Guard
-                            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+                            contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike|but)\b', prop) if len(cl.strip()) > 8]
                             is_contrast_subclause_entailed = False
                             if len(contrast_clauses) >= 2:
                                 for cl in contrast_clauses:
@@ -1319,6 +1506,9 @@ class GradingEngine:
                                         break
 
                             if is_contrapositive or is_contrast_subclause_entailed:
+                                continue
+
+                            if is_motivational_boundary_cand and not (rev_nli["contradiction"] >= 0.85 and c_ent < 0.08):
                                 continue
 
                             has_polarity_inversion = bool(re.search(
@@ -1342,7 +1532,7 @@ class GradingEngine:
                     is_contrapositive = has_conditional and len(base_dist_overlap) >= 3 and c_contra < 0.35
 
                     # Guard B: Multi-Clause Contrastive Proposition Guard
-                    contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike)\b', prop) if len(cl.strip()) > 8]
+                    contrast_clauses = [cl.strip() for cl in re.split(r'(?i)\b(?:whereas|while|unlike|but)\b', prop) if len(cl.strip()) > 8]
                     is_contrast_subclause_entailed = False
                     if len(contrast_clauses) >= 2:
                         for cl in contrast_clauses:
@@ -1357,6 +1547,8 @@ class GradingEngine:
                         continue
                     if is_explicit_neg:
                         rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
+                        if is_motivational_boundary_cand and not (rev_nli["contradiction"] >= 0.85 and c_ent < 0.08):
+                            continue
                         if (c_contra >= 0.48 and c_contra > c_ent and rev_nli["contradiction"] >= 0.35) or (
                             c_contra >= 0.03
                             and c_contra > c_ent
@@ -1375,6 +1567,8 @@ class GradingEngine:
                         # Verified by Reverse NLI so partial elaborations (e.g. Student A on MBL with rev_nli < 0.30)
                         # are not falsely penalized as contradictions
                         rev_nli = ModelsLoader.predict_nli([(prop, c_text)])[0]
+                        if is_motivational_boundary_cand and not (rev_nli["contradiction"] >= 0.85 and c_ent < 0.08):
+                            continue
                         has_polarity_inversion = bool(re.search(
                             r'(?i)\b(only|never|cannot|can\'t|without|always|exclusively|ignore|reject|pull[\s-]+power|unplug)\b',
                             c_text

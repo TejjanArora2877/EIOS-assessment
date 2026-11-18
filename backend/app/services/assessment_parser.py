@@ -30,13 +30,13 @@ class AssessmentDocumentParser:
     )
 
     QUESTION_HEADER_PATTERN = re.compile(
-        r'(?i)^\s*(?:question|ques|q|problem|task|part)\s*[\.\:\-\)]*\s*(\d+|[a-zA-Z])(?:[:.\-\)]\s*(.*))?$'
+        r'(?i)^\s*(?:question|ques|q|problem|part)\s*[\.\:\-\)]*\s*(\d+|[a-zA-Z])\b(?:\s*[:.\-\)]\s*(.*))?$'
     )
     MODEL_ANSWER_PATTERN = re.compile(
-        r'(?i)^\s*(?:model\s+answer|authoritative\s+answer|expected\s+answer|sample\s+answer|answer\s+key|marking\s+scheme|solution|answer)\s*[:\-]?\s*(.*)$'
+        r'(?i)^\s*(?:model\s+answer|authoritative\s+answer|expected\s+answer|sample\s+answer|answer\s+key|solution|answer)\s*[:\-]?\s*(.*)$'
     )
     RUBRIC_HEADER_PATTERN = re.compile(
-        r'(?i)^\s*(?:rubric|grading\s+criteria|marking\s+criteria|evaluation\s+criteria|criteria)\s*[:\-]?\s*(.*)$'
+        r'(?i)^\s*(?:rubric|grading\s+criteria|marking\s+criteria|evaluation\s+criteria|marking\s+scheme|criteria)\s*[:\-]?\s*(.*)$'
     )
     BULLET_CRITERION_PATTERN = re.compile(
         r'(?i)^\s*(?:[-*•]|\d+[\.)])\s*(.+?)(?:\s*[\(\[]\s*(\d+(?:\.\d+)?)\s*(?:marks?|pts?|points?)\s*[\)\]])?\s*[:\-]\s*(.*)$'
@@ -80,27 +80,51 @@ class AssessmentDocumentParser:
             name_val = row[name_idx].strip() if name_idx < len(row) else ""
             desc_val = row[desc_idx].strip() if desc_idx < len(row) else ""
 
-            marks_val = 5.0
+            # Check if row has a parseable numeric marks value (> 0)
+            parsed_marks: Optional[float] = None
             if marks_idx is not None and marks_idx < len(row):
                 m = re.search(r'(\d+(?:\.\d+)?)', row[marks_idx])
                 if m:
                     try:
-                        marks_val = float(m.group(1))
+                        val = float(m.group(1))
+                        if val > 0:
+                            parsed_marks = val
                     except ValueError:
-                        marks_val = 5.0
+                        parsed_marks = None
 
-            if not name_val and not desc_val:
-                continue
-            if not name_val:
-                name_val = f"Criterion {r_idx + 1}"
-            if not desc_val:
-                desc_val = name_val
+            if parsed_marks is not None:
+                if not name_val and not desc_val:
+                    continue
+                if not name_val:
+                    name_val = f"Criterion {len(extracted_criteria) + 1}"
+                if not desc_val:
+                    desc_val = name_val
 
-            extracted_criteria.append({
-                "name": name_val,
-                "description": desc_val,
-                "max_marks": marks_val if marks_val > 0 else 5.0
-            })
+                extracted_criteria.append({
+                    "name": name_val,
+                    "description": desc_val,
+                    "max_marks": parsed_marks
+                })
+            else:
+                # Row lacks valid numeric marks
+                # If a previous criterion exists in this table, append non-empty text to its description
+                non_empty_parts = [
+                    row[c].strip() for c in range(len(row))
+                    if c != marks_idx and row[c].strip()
+                ]
+                row_text = " ".join(non_empty_parts).strip()
+                if extracted_criteria and row_text:
+                    extracted_criteria[-1]["description"] = (
+                        extracted_criteria[-1]["description"] + " " + row_text
+                    ).strip()
+                elif not extracted_criteria and (name_val or desc_val):
+                    name = name_val or "Criterion 1"
+                    desc = desc_val or name
+                    extracted_criteria.append({
+                        "name": name,
+                        "description": desc,
+                        "max_marks": 5.0
+                    })
 
         return extracted_criteria
 
@@ -170,29 +194,26 @@ class AssessmentDocumentParser:
 
                 if TableLinearizer.is_rubric_table(headers):
                     tbl_criteria = cls._parse_rubric_table(headers, rows)
-                    if not questions:
-                        unassigned_rubric_tables.append(tbl_criteria)
-                    else:
-                        empty_questions = [q for q in questions if not q["has_real_criteria"]]
-                        if len(empty_questions) > 1 and len(tbl_criteria) >= len(empty_questions):
-                            if len(tbl_criteria) == len(empty_questions):
-                                for target_q, crit in zip(empty_questions, tbl_criteria):
-                                    target_q["criteria"].append(crit)
-                                    target_q["has_real_criteria"] = True
-                            else:
-                                for idx, crit in enumerate(tbl_criteria):
-                                    target_q = empty_questions[idx % len(empty_questions)]
-                                    target_q["criteria"].append(crit)
-                                    target_q["has_real_criteria"] = True
-                        elif empty_questions:
-                            empty_questions[-1]["criteria"].extend(tbl_criteria)
-                            empty_questions[-1]["has_real_criteria"] = True
-                        elif curr_q:
-                            curr_q["criteria"].extend(tbl_criteria)
-                            curr_q["has_real_criteria"] = True
+                    all_empty = all(not q.get("has_real_criteria", False) for q in questions)
+                    if all_empty and len(questions) > 1 and len(tbl_criteria) >= len(questions):
+                        # Consolidated master rubric table at document end when no prior question had criteria
+                        if len(tbl_criteria) == len(questions):
+                            for target_q, crit in zip(questions, tbl_criteria):
+                                target_q["criteria"].append(crit)
+                                target_q["has_real_criteria"] = True
                         else:
-                            questions[-1]["criteria"].extend(tbl_criteria)
-                            questions[-1]["has_real_criteria"] = True
+                            for idx, crit in enumerate(tbl_criteria):
+                                target_q = questions[idx % len(questions)]
+                                target_q["criteria"].append(crit)
+                                target_q["has_real_criteria"] = True
+                        if curr_q:
+                            curr_q["active_section"] = "rubric"
+                    elif curr_q:
+                        curr_q["criteria"].extend(tbl_criteria)
+                        curr_q["has_real_criteria"] = True
+                        curr_q["active_section"] = "rubric"
+                    else:
+                        unassigned_rubric_tables.append(tbl_criteria)
                 else:
                     # Non-rubric comparison or data table: linearize and append to active subsection
                     linearized = TableLinearizer.linearize_table(headers, rows)
@@ -215,6 +236,10 @@ class AssessmentDocumentParser:
                     if not stripped:
                         continue
 
+                    # Ignore standalone page numbers: "Page 2", "Page 2 of 5", "2", "- 2 -"
+                    if re.match(r'^(?:page\s*\d+(?:\s*(?:of|/)\s*\d+)?|\d+|-+\s*\d+\s*-+|page\s*[-–—]\s*\d+)$', stripped, re.IGNORECASE):
+                        continue
+
                     # Check for explicit Title prefix
                     m_title = cls.TITLE_PREFIX_PATTERN.match(stripped)
                     if m_title:
@@ -227,29 +252,118 @@ class AssessmentDocumentParser:
                         title_found = True
                         continue
 
+                    # Check for explicit continuation markers (e.g. "Question 2 (Continued)", "Model Answer (cont.)")
+                    is_continuation = bool(re.search(r'\b(?:continued|cont\.?)\b', stripped, re.IGNORECASE))
+                    if is_continuation:
+                        if curr_q:
+                            if re.search(r'\b(?:model\s+answer|answer)\b', stripped, re.IGNORECASE):
+                                curr_q["active_section"] = "model_answer"
+                        clean_trailing = re.sub(
+                            r'(?i)^\s*(?:question|ques|q|problem|part)?\s*[\.\:\-\)]*\s*\d*\s*[\.\:\-\)]*\s*(?:\(?\s*(?:continued|cont\.?)\s*\)?)\s*[:.\-\)]*\s*',
+                            '',
+                            stripped
+                        ).strip()
+                        if clean_trailing and curr_q:
+                            if curr_q["active_section"] == "model_answer":
+                                curr_q["model_answer_parts"].append(clean_trailing)
+                            elif curr_q["active_section"] == "rubric":
+                                if curr_q["criteria"]:
+                                    curr_q["criteria"][-1]["description"] += " " + clean_trailing
+                            else:
+                                curr_q["question_text_parts"].append(clean_trailing)
+                        continue
+
                     # Check for Question Header
                     m_q = cls.QUESTION_HEADER_PATTERN.match(stripped)
                     if m_q:
-                        curr_q = cls._start_new_question(questions)
-                        curr_q["active_section"] = "question"
+                        raw_ident = m_q.group(1).strip()
                         trailing = m_q.group(2).strip() if m_q.group(2) else ""
 
-                        # Check if Model Answer appears on the same line as Question Header
-                        ma_match = re.search(
-                            r'(?i)\b(?:Model\s+Answer|Authoritative\s+Answer|Expected\s+Answer|Sample\s+Answer|Answer\s+Key)\s*[:\-]\s*(.*)$',
-                            trailing
-                        )
-                        if ma_match:
-                            q_part = trailing[:ma_match.start()].strip()
-                            ans_part = ma_match.group(1).strip()
-                            if q_part:
-                                curr_q["question_text_parts"].append(q_part)
-                            curr_q["active_section"] = "model_answer"
-                            if ans_part:
-                                curr_q["model_answer_parts"].append(ans_part)
-                        elif trailing:
-                            curr_q["question_text_parts"].append(trailing)
-                        continue
+                        kw_match = re.match(r'(?i)^\s*(question|ques|q|problem|part)\b', stripped)
+                        cand_kw = kw_match.group(1).lower() if kw_match else ""
+
+                        should_start_new_q = False
+                        if not questions:
+                            should_start_new_q = True
+                        else:
+                            last_q = questions[-1]
+                            last_num = last_q.get("doc_num")
+                            last_kw = last_q.get("doc_kw", "question")
+
+                            if raw_ident.isdigit():
+                                cand_num = int(raw_ident)
+                                if last_num is not None:
+                                    if cand_num == last_num:
+                                        # Repeated header for current question across page breaks
+                                        if trailing:
+                                            if curr_q and curr_q["active_section"] == "model_answer":
+                                                curr_q["model_answer_parts"].append(trailing)
+                                            elif curr_q:
+                                                curr_q["question_text_parts"].append(trailing)
+                                        continue
+                                    elif cand_num < last_num:
+                                        # Number went backwards (e.g. "Part 1" or step 1 inside model answer)
+                                        if curr_q and curr_q["active_section"] == "model_answer":
+                                            curr_q["model_answer_parts"].append(stripped)
+                                        elif curr_q and curr_q["active_section"] == "rubric":
+                                            if curr_q["criteria"]:
+                                                curr_q["criteria"][-1]["description"] += " " + stripped
+                                        elif curr_q:
+                                            curr_q["question_text_parts"].append(stripped)
+                                        continue
+                                    else:
+                                        # cand_num > last_num (e.g. Question 3 after Question 2)
+                                        if cand_kw == "part" and last_kw in ["question", "ques", "q"] and curr_q and curr_q["active_section"] == "model_answer":
+                                            curr_q["model_answer_parts"].append(stripped)
+                                            continue
+                                        should_start_new_q = True
+                                else:
+                                    should_start_new_q = True
+                            else:
+                                # Alphabetic identifier (A, B, C...)
+                                cand_alpha = raw_ident.upper()
+                                last_alpha = last_q.get("doc_ident", "").upper() if not str(last_q.get("doc_ident", "")).isdigit() else ""
+                                if last_alpha:
+                                    if cand_alpha == last_alpha or ord(cand_alpha) <= ord(last_alpha):
+                                        if curr_q and curr_q["active_section"] == "model_answer":
+                                            curr_q["model_answer_parts"].append(stripped)
+                                        elif curr_q:
+                                            curr_q["question_text_parts"].append(stripped)
+                                        continue
+                                    else:
+                                        should_start_new_q = True
+                                else:
+                                    # Document was numeric (Question 1, Question 2), so 'Part A' is internal prose
+                                    if curr_q and curr_q["active_section"] == "model_answer":
+                                        curr_q["model_answer_parts"].append(stripped)
+                                    elif curr_q:
+                                        curr_q["question_text_parts"].append(stripped)
+                                    continue
+
+                        if should_start_new_q:
+                            curr_q = cls._start_new_question(questions)
+                            curr_q["active_section"] = "question"
+                            curr_q["doc_ident"] = raw_ident
+                            curr_q["doc_kw"] = cand_kw
+                            if raw_ident.isdigit():
+                                curr_q["doc_num"] = int(raw_ident)
+
+                            # Check if Model Answer appears on the same line as Question Header
+                            ma_match = re.search(
+                                r'(?i)\b(?:Model\s+Answer|Authoritative\s+Answer|Expected\s+Answer|Sample\s+Answer|Answer\s+Key)\s*[:\-]\s*(.*)$',
+                                trailing
+                            )
+                            if ma_match:
+                                q_part = trailing[:ma_match.start()].strip()
+                                ans_part = ma_match.group(1).strip()
+                                if q_part:
+                                    curr_q["question_text_parts"].append(q_part)
+                                curr_q["active_section"] = "model_answer"
+                                if ans_part:
+                                    curr_q["model_answer_parts"].append(ans_part)
+                            elif trailing:
+                                curr_q["question_text_parts"].append(trailing)
+                            continue
 
                     # If no question has started yet and the document has explicit questions,
                     # this text is preamble or document title
@@ -262,33 +376,35 @@ class AssessmentDocumentParser:
                     # Check for Model Answer Header
                     m_ma = cls.MODEL_ANSWER_PATTERN.match(stripped)
                     if m_ma:
-                        if not curr_q:
+                        if not curr_q and not has_explicit_questions:
                             curr_q = cls._start_new_question(questions)
-                        curr_q["active_section"] = "model_answer"
-                        trailing = m_ma.group(1).strip() if m_ma.group(1) else ""
-                        if trailing:
-                            curr_q["model_answer_parts"].append(trailing)
+                        if curr_q:
+                            curr_q["active_section"] = "model_answer"
+                            trailing = m_ma.group(1).strip() if m_ma.group(1) else ""
+                            if trailing:
+                                curr_q["model_answer_parts"].append(trailing)
                         continue
 
                     # Check for Rubric Header
                     m_rub = cls.RUBRIC_HEADER_PATTERN.match(stripped)
                     if m_rub:
-                        if not curr_q:
+                        if not curr_q and not has_explicit_questions:
                             curr_q = cls._start_new_question(questions)
-                        curr_q["active_section"] = "rubric"
-                        trailing = m_rub.group(1).strip() if m_rub.group(1) else ""
-                        if trailing:
-                            b_m = cls.BULLET_CRITERION_PATTERN.match(trailing)
-                            if b_m:
-                                c_name = b_m.group(1).strip()
-                                c_marks = float(b_m.group(2)) if b_m.group(2) else 5.0
-                                c_desc = b_m.group(3).strip() if b_m.group(3) else c_name
-                                curr_q["criteria"].append({
-                                    "name": c_name,
-                                    "description": c_desc,
-                                    "max_marks": c_marks
-                                })
-                                curr_q["has_real_criteria"] = True
+                        if curr_q:
+                            curr_q["active_section"] = "rubric"
+                            trailing = m_rub.group(1).strip() if m_rub.group(1) else ""
+                            if trailing:
+                                b_m = cls.BULLET_CRITERION_PATTERN.match(trailing)
+                                if b_m:
+                                    c_name = b_m.group(1).strip()
+                                    c_marks = float(b_m.group(2)) if b_m.group(2) else 5.0
+                                    c_desc = b_m.group(3).strip() if b_m.group(3) else c_name
+                                    curr_q["criteria"].append({
+                                        "name": c_name,
+                                        "description": c_desc,
+                                        "max_marks": c_marks
+                                    })
+                                    curr_q["has_real_criteria"] = True
                         continue
 
                     # Normal text line inside active section
@@ -296,6 +412,8 @@ class AssessmentDocumentParser:
                         if not title_found and len(stripped) < 120 and "|" not in stripped:
                             title = stripped
                             title_found = True
+                            continue
+                        if has_explicit_questions:
                             continue
                         curr_q = cls._start_new_question(questions)
 
